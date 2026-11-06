@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "name": "构建工具_Xmake.tar.gz",
+      "kind": "dependency",
+      "package_path": "附件/offline/build_tool_xmake.tar.gz",
+      "description": "Linux离线构建工具",
+      "bytes": 1954412,
+      "sha256": "99df17ad8eaaba5d1e918c6915ba210b08b7931203fb6241e096e9010526f8f1"
+    },
+    {
+      "name": "Python基础依赖.tar.gz",
+      "kind": "dependency",
+      "package_path": "附件/offline/python_deps_base.tar.gz",
+      "description": "Python基础与运行依赖",
+      "bytes": 113454054,
+      "sha256": "704341786e71c23ea6cb5812cc5b4af5f244e0a3bc110fcef1bdc7984250ba0b"
+    },
+    {
+      "name": "Python模型依赖.tar.gz",
+      "kind": "dependency",
+      "package_path": "附件/offline/python_deps_models.tar.gz",
+      "description": "模型加载与组件依赖",
+      "bytes": 26301148,
+      "sha256": "488611f264b1d126f1c0ac6ef3ccfa3de978f56e23e2fb89b220ae235d8404dd"
+    },
+    {
+      "name": "视频评测依赖.tar.gz",
+      "kind": "dependency",
+      "package_path": "附件/offline/python_deps_metrics.tar.gz",
+      "description": "视频解码和SSIM比较依赖",
+      "bytes": 51687506,
+      "sha256": "a694cdca68d1b9d1974ce7402df60edf599b09f44f78ee0d70c777e8e98dad88"
+    },
+    {
+      "name": "Triton依赖.whl",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/triton_dtk2604.whl",
+      "description": "厂商配套Triton依赖",
+      "bytes": 105484167,
+      "sha256": "e397b16365da22508353ce44a45f5be82f8ee58e49853a3df06aa8f6f83d5581"
+    },
+    {
+      "name": "FlashAttention.part01",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part00",
+      "description": "厂商FlashAttention wheel的第1/7片",
+      "bytes": 104857600,
+      "sha256": "bfaa757e842676886c87e896e5829302a7ed9410dd3e10de12280614e89ec488"
+    },
+    {
+      "name": "FlashAttention.part02",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part01",
+      "description": "厂商FlashAttention wheel的第2/7片",
+      "bytes": 104857600,
+      "sha256": "33113a801a3a34511f6db536a848221f68eddcb5a4db30a05d8d122df11970e6"
+    },
+    {
+      "name": "FlashAttention.part03",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part02",
+      "description": "厂商FlashAttention wheel的第3/7片",
+      "bytes": 104857600,
+      "sha256": "1e287480287f0a187257e7fcfd50572e62dac5a9323cddce06e7cf8d5d0149a2"
+    },
+    {
+      "name": "FlashAttention.part04",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part03",
+      "description": "厂商FlashAttention wheel的第4/7片",
+      "bytes": 104857600,
+      "sha256": "5c25cd0275d8da39cbc72d7b0dde24a32ea305c51b3073edb7a9599e4c76781c"
+    },
+    {
+      "name": "FlashAttention.part05",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part04",
+      "description": "厂商FlashAttention wheel的第5/7片",
+      "bytes": 104857600,
+      "sha256": "dcd9aed482d4b9d5e8d911de05c6449a825110f7de3aa49b9f06acd735534a24"
+    },
+    {
+      "name": "FlashAttention.part06",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part05",
+      "description": "厂商FlashAttention wheel的第6/7片",
+      "bytes": 104857600,
+      "sha256": "98e8e63ea06dfd32424b935a1afc1119711d0f0f11e4c0ab7c8fe9295a3a3c50"
+    },
+    {
+      "name": "FlashAttention.part07",
+      "kind": "dependency",
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part06",
+      "description": "厂商FlashAttention wheel的第7/7片",
+      "bytes": 29752943,
+      "sha256": "7c4e4b3d0eb30d6a90864e780755b5496a2a35ce22ec72d877642f0b020fd3d1"
+    }
+  ],
+  "weights_included": false,
+  "engineering": {
+    "directory": "工程源码",
+    "manifest": "附件/manifest.json"
+  }
+}

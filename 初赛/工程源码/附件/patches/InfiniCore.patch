@@ -1,0 +1,421 @@
+diff --git a/scripts/build_ntops.py b/scripts/build_ntops.py
+index 6012496..0c88f33 100644
+--- a/scripts/build_ntops.py
++++ b/scripts/build_ntops.py
+@@ -1,5 +1,6 @@
+ import concurrent.futures
+ import importlib
++import os
+ import pathlib
+ 
+ from infiniop.ninetoothed.build import BUILD_DIRECTORY_PATH
+@@ -8,6 +9,15 @@ CURRENT_FILE_PATH = pathlib.Path(__file__)
+ 
+ SRC_DIR_PATH = CURRENT_FILE_PATH.parent.parent / "src"
+ 
++# `NINETOOTHED_OPS="relu,swiglu"` restricts the build to those operators,
++# so a port in progress (for example the flash_attention kernel) does not
++# block the rest of the suite.
++SELECTED_OPS = {
++    name.strip()
++    for name in os.environ.get("NINETOOTHED_OPS", "").split(",")
++    if name.strip()
++}
++
+ 
+ def _find_and_build_ops():
+     ops_path = SRC_DIR_PATH / "infiniop" / "ops"
+@@ -21,6 +31,9 @@ def _find_and_build_ops():
+             if not ninetoothed_path.is_dir():
+                 continue
+ 
++            if SELECTED_OPS and op_dir.name not in SELECTED_OPS:
++                continue
++
+             build_file = ninetoothed_path / "build.py"
+             if not build_file.exists():
+                 continue
+diff --git a/src/infinicore/nn/rope.cc b/src/infinicore/nn/rope.cc
+index 85064e7..26ce96a 100644
+--- a/src/infinicore/nn/rope.cc
++++ b/src/infinicore/nn/rope.cc
+@@ -118,18 +118,29 @@ void RoPE::initialize_cache() {
+         }
+     }
+ 
++    // Tensor::copy_from queues H2D work without retaining the host owner.
++    // These CPU views borrow local vectors, including the branch-local combined
++    // table. Finish each upload before its owner can leave scope. Initialization
++    // is outside the inference loop; the cached values and math stay unchanged.
++    auto copy_cache_from_cpu = [this](Tensor dst, const Tensor &src) {
++        dst->copy_from(src);
++        if (device_.getType() != Device::Type::CPU) {
++            context::syncStream();
++        }
++    };
++
+     // Convert to target dtype on CPU (matching Python's numpy astype conversion pattern)
+     // Python: np_array.astype(ml_dtypes.bfloat16, copy=True) converts F32 -> BF16
+     if (dtype_ == DataType::F32) {
+         // Direct use of F32 data
+         auto sin_f32_cpu = Tensor::from_blob(sin_data.data(), {max_seq_len_, cache_dim}, DataType::F32, cpu_device);
+         auto cos_f32_cpu = Tensor::from_blob(cos_data.data(), {max_seq_len_, cache_dim}, DataType::F32, cpu_device);
+-        sin_cache_->copy_from(sin_f32_cpu);
+-        cos_cache_->copy_from(cos_f32_cpu);
++        copy_cache_from_cpu(sin_cache_, sin_f32_cpu);
++        copy_cache_from_cpu(cos_cache_, cos_f32_cpu);
+         if (cos_sin_cache_) {
+             auto combined = combine_cos_sin_cache(cos_data, sin_data, max_seq_len_, cache_dim);
+             auto combined_cpu = Tensor::from_blob(combined.data(), {max_seq_len_, rotary_dim_}, DataType::F32, cpu_device);
+-            cos_sin_cache_->copy_from(combined_cpu);
++            copy_cache_from_cpu(cos_sin_cache_, combined_cpu);
+         }
+     } else if (dtype_ == DataType::BF16) {
+         // Convert F32 to BF16 using the same conversion as Python's ml_dtypes.bfloat16
+@@ -146,12 +157,12 @@ void RoPE::initialize_cache() {
+         auto cos_bf16_cpu = Tensor::from_blob(cos_bf16_data.data(), {max_seq_len_, cache_dim}, DataType::BF16, cpu_device);
+ 
+         // copy_from handles cross-device copying to target device
+-        sin_cache_->copy_from(sin_bf16_cpu);
+-        cos_cache_->copy_from(cos_bf16_cpu);
++        copy_cache_from_cpu(sin_cache_, sin_bf16_cpu);
++        copy_cache_from_cpu(cos_cache_, cos_bf16_cpu);
+         if (cos_sin_cache_) {
+             auto combined = combine_cos_sin_cache(cos_bf16_data, sin_bf16_data, max_seq_len_, cache_dim);
+             auto combined_cpu = Tensor::from_blob(combined.data(), {max_seq_len_, rotary_dim_}, DataType::BF16, cpu_device);
+-            cos_sin_cache_->copy_from(combined_cpu);
++            copy_cache_from_cpu(cos_sin_cache_, combined_cpu);
+         }
+     } else if (dtype_ == DataType::F16) {
+         // Convert F32 to F16
+@@ -166,12 +177,12 @@ void RoPE::initialize_cache() {
+         auto sin_f16_cpu = Tensor::from_blob(sin_f16_data.data(), {max_seq_len_, cache_dim}, DataType::F16, cpu_device);
+         auto cos_f16_cpu = Tensor::from_blob(cos_f16_data.data(), {max_seq_len_, cache_dim}, DataType::F16, cpu_device);
+ 
+-        sin_cache_->copy_from(sin_f16_cpu);
+-        cos_cache_->copy_from(cos_f16_cpu);
++        copy_cache_from_cpu(sin_cache_, sin_f16_cpu);
++        copy_cache_from_cpu(cos_cache_, cos_f16_cpu);
+         if (cos_sin_cache_) {
+             auto combined = combine_cos_sin_cache(cos_f16_data, sin_f16_data, max_seq_len_, cache_dim);
+             auto combined_cpu = Tensor::from_blob(combined.data(), {max_seq_len_, rotary_dim_}, DataType::F16, cpu_device);
+-            cos_sin_cache_->copy_from(combined_cpu);
++            copy_cache_from_cpu(cos_sin_cache_, combined_cpu);
+         }
+     } else {
+         throw std::runtime_error(
+diff --git a/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc b/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
+index 7a2aaf1..21ded89 100644
+--- a/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
++++ b/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
+@@ -1,4 +1,7 @@
+-#if defined(ENABLE_HYGON_API) && defined(ENABLE_FLASH_ATTN)
++// Keep Hygon registration available without a separately linked flash-attn library.
++// The computation below is unchanged from the designated reference commit
++// f32e2fbb2a9b2ca912b5711f4f3836c403196a74. No project-specific SDPA rewrite.
++#if defined(ENABLE_HYGON_API)
+ #include "infinicore/ops/mha.hpp"
+ 
+ #include "../../../adaptor/flash_attn/hygon/flash_attn_hygon.hpp"
+@@ -103,4 +106,4 @@ static bool registered = []() {
+ }();
+ 
+ } // namespace infinicore::op::mha_impl::flashattn
+-#endif // ENABLE_HYGON_API && ENABLE_FLASH_ATTN
++#endif // ENABLE_HYGON_API
+diff --git a/src/infiniop/ninetoothed/build.py b/src/infiniop/ninetoothed/build.py
+index 153e6b9..9e11ea7 100644
+--- a/src/infiniop/ninetoothed/build.py
++++ b/src/infiniop/ninetoothed/build.py
+@@ -2,10 +2,12 @@ import concurrent.futures
+ import functools
+ import inspect
+ import itertools
++import os
+ import pathlib
++import re
+ 
+-import ninetoothed
+-from ninetoothed.aot import _HEADER_PATH
++from ninetoothed.backends.materializers.cpp import write_header
++from ninetoothed.compiler.driver import lower as lower_kernel
+ 
+ CURRENT_FILE_PATH = pathlib.Path(__file__)
+ 
+@@ -13,6 +15,22 @@ BUILD_DIRECTORY_PATH = (
+     CURRENT_FILE_PATH.parent.parent.parent.parent / "build" / "ninetoothed"
+ )
+ 
++# Emit CUDA C through NineToothed instead of Triton IR: the vendor compiler
++# (DTK's nvcc/dcc on Hygon) then targets the local architecture directly.
++BACKEND = "cuda"
++
++# The device target is supplied per platform so the same bridge works for CUDA
++# (`sm_<version>`) and Hygon DCU (`gfx<version>`).
++BACKEND_OPTIONS = {}
++if os.environ.get("NINETOOTHED_ARCH"):
++    BACKEND_OPTIONS["arch"] = os.environ["NINETOOTHED_ARCH"]
++
++_LAUNCH_SIGNATURE_PATTERN = re.compile(
++    r'extern\s+"C"\s+int\s+(launch_\w+)\s*\((.*?)\)\s*\{', re.DOTALL
++)
++
++_TENSOR_PARAMETER_PATTERN = re.compile(r"tensor_(\d+)_(size|stride)_(\d+)")
++
+ 
+ def build(premake, constexpr_param_grid, caller, op_name, output_dir):
+     headers = []
+@@ -20,6 +38,11 @@ def build(premake, constexpr_param_grid, caller, op_name, output_dir):
+     combinations = []
+     launches = []
+ 
++    output_dir = pathlib.Path(output_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    write_header(output_dir)
++
+     with concurrent.futures.ProcessPoolExecutor() as executor:
+         futures = []
+ 
+@@ -61,7 +84,7 @@ def build(premake, constexpr_param_grid, caller, op_name, output_dir):
+         f"{type} {param}" for param, type in zip(param_names, param_types)
+     )
+ 
+-    source_file_name = f"{op_name}.c"
++    source_file_name = f"{op_name}.cpp"
+     header_file_name = f"{op_name}.h"
+ 
+     func_sig = f"NineToothedResult launch_{op_name}({param_decls})"
+@@ -79,11 +102,11 @@ def build(premake, constexpr_param_grid, caller, op_name, output_dir):
+ #include "infinicore.h"
+ 
+ {includes}\n\n{op_def}\n"""
+-    header_content = f"""#include "{_HEADER_PATH}"
++    header_content = f"""#include "ninetoothed.h"
+ \n{op_decl}\n"""
+ 
+-    (BUILD_DIRECTORY_PATH / source_file_name).write_text(source_content)
+-    (BUILD_DIRECTORY_PATH / header_file_name).write_text(header_content)
++    (output_dir / source_file_name).write_text(source_content)
++    (output_dir / header_file_name).write_text(header_content)
+ 
+ 
+ def _make(premake, combination, caller, op_name, output_dir):
+@@ -99,23 +122,111 @@ def _make(premake, combination, caller, op_name, output_dir):
+ 
+     kernel_name = f"{op_name}_{_generate_suffix(combination.values())}"
+ 
+-    ninetoothed.make(
++    lower_kernel(
+         arrangement,
+         application,
+         tensors,
+-        caller=caller,
++        backend=BACKEND,
++        caller="cuda",
+         kernel_name=kernel_name,
+         output_dir=output_dir,
++        write=True,
++        **BACKEND_OPTIONS,
++    )
++
++    launch_name, parameters = _parse_launch_signature(
++        output_dir / f"{kernel_name}.cu", kernel_name
+     )
+ 
+-    header = output_dir / f"{kernel_name}.h"
++    header = _write_launch_declaration(output_dir, kernel_name, launch_name, parameters)
++
+     param_names = ("stream",) + tuple(inspect.signature(application).parameters.keys())
+-    launch = f"""    if ({_generate_condition(combination)})
+-        return launch_{kernel_name}({", ".join(param_names)});"""
++    launch = (
++        f"    if ({_generate_condition(combination)})\n"
++        f"        return {launch_name}"
++        f"({', '.join(_launch_arguments(parameters, param_names[1:]))});"
++    )
+ 
+     return header, param_names, combination, launch
+ 
+ 
++def _parse_launch_signature(source_path, kernel_name):
++    """Read the C entry point the CUDA backend generated for one kernel."""
++    source = pathlib.Path(source_path).read_text()
++
++    match = _LAUNCH_SIGNATURE_PATTERN.search(source)
++
++    if match is None:
++        raise ValueError(f"No launch function found in {source_path}.")
++
++    launch_name = match.group(1)
++    parameters = []
++
++    for declaration in match.group(2).split(","):
++        declaration = declaration.strip()
++
++        if not declaration:
++            continue
++
++        type_name, _, name = declaration.rpartition(" ")
++
++        parameters.append((type_name.strip(), name.strip()))
++
++    return launch_name, tuple(parameters)
++
++
++def _write_launch_declaration(output_dir, kernel_name, launch_name, parameters):
++    declaration = ", ".join(f"{type_name} {name}" for type_name, name in parameters)
++    header_path = pathlib.Path(output_dir) / f"{kernel_name}.launch.h"
++    header_path.write_text(
++        f"#ifndef NINETOOTHED_LAUNCH_{kernel_name.upper()}_H\n"
++        f"#define NINETOOTHED_LAUNCH_{kernel_name.upper()}_H\n\n"
++        "#include <cuda_fp16.h>\n"
++        "#include <cuda_bf16.h>\n"
++        "#include <cuda_runtime.h>\n"
++        "#include <stdint.h>\n\n"
++        f'extern "C" int {launch_name}({declaration});\n\n'
++        "#endif\n"
++    )
++
++    return header_path.name
++
++
++def _launch_arguments(parameters, tensor_names):
++    """Translate the generated parameter list into dispatcher expressions.
++
++    The CUDA backend emits tensor pointers followed by each tensor's sizes and
++    strides, with the stream last; ``NineToothedTensor`` carries exactly that
++    information, so the dispatcher can forward it positionally using the
++    application's own parameter names.
++    """
++    arguments = []
++    tensor_index = 0
++
++    for type_name, name in parameters:
++        if "*" in type_name:
++            arguments.append(
++                f"static_cast<{type_name}>({tensor_names[tensor_index]}.data)"
++            )
++            tensor_index += 1
++            continue
++
++        if name == "stream":
++            arguments.append("reinterpret_cast<cudaStream_t>(stream)")
++            continue
++
++        match = _TENSOR_PARAMETER_PATTERN.search(name)
++
++        if match is None:
++            raise ValueError(f"Cannot map launch parameter `{name}` to a tensor.")
++
++        index, kind, axis = match.groups()
++        field = "shape" if kind == "size" else "strides"
++        arguments.append(f"{tensor_names[int(index)]}.{field}[{axis}]")
++
++    return arguments
++
++
+ def _generate_condition(combination):
+     return " && ".join(f"{param} == {value}" for param, value in combination.items())
+ 
+@@ -128,4 +239,4 @@ def _generate_param_value_combinations(param_grid):
+     keys = list(param_grid.keys())
+     value_combinations = itertools.product(*param_grid.values())
+ 
+-    return tuple(dict(zip(keys, combination)) for combination in value_combinations)
++    return tuple(dict(zip(keys, combination)) for combination in value_combinations)
+\ No newline at end of file
+diff --git a/xmake.lua b/xmake.lua
+index 5684102..c694037 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,6 +1,18 @@
+ add_rules("mode.debug", "mode.release")
+-add_requires("boost", {configs = {stacktrace = true}})
+-add_requires("pybind11")
++-- Boost is not referenced by the sources; keep it opt-in so an offline host
++-- can configure the build.
++if has_config("boost-stacktrace") then
++    add_requires("boost", {configs = {stacktrace = true}})
++end
++
++-- pybind11 is header-only. An offline build can point PYBIND11_INCLUDE at a
++-- local copy instead of fetching the package from the network.
++local pybind11_include = os.getenv("PYBIND11_INCLUDE")
++if pybind11_include then
++    add_includedirs(pybind11_include, {public = true})
++else
++    add_requires("pybind11")
++end
+ 
+ -- Define color codes
+ local GREEN = '\27[0;32m'
+@@ -855,7 +867,9 @@ target("infinicore_cpp_api")
+     -- pybind11/embed.h for mha_kvcache branch
+     if has_config("moore-gpu") and has_config("aten") and has_config("flash-attn") then
+         add_defines("ENABLE_MOORE_MATE_FLASH_ATTN")
+-        add_packages("pybind11")
++        if not pybind11_include then
++            add_packages("pybind11")
++        end
+     end
+ 
+     before_build(function (target)
+@@ -1049,11 +1063,20 @@ target("infinicore_cpp_api")
+     add_files("src/infinicore/ops/*/*.cc")
+     add_files("src/infinicore/ops/*/*/*.cc")
+     add_files("src/infinicore/ops/*/*/*/*.cc")
+-    -- Platform-private Hygon sources are guarded and only kept in Hygon builds.
+-    if has_config("hygon-dcu") and get_config("flash-attn") and get_config("flash-attn") ~= "" then
+-        -- Hygon links against a prebuilt flash-attn extension with a different ABI.
+-        -- Keep the platform-specific implementation under each op's hygon/ folder.
+-        add_files("src/infinicore/adaptor/flash_attn/hygon/*.cc")
++    -- Platform-private Hygon sources.
++    --
++    -- The flash-attn adaptor is only linked when a prebuilt extension is
++    -- configured, but the op files under each `hygon/` directory must stay in
++    -- the build: `multi_head_attention/hygon` carries the ATen fallback that is
++    -- the *only* registration of MultiheadAttention on this device. Dropping
++    -- the whole directory left the op with no implementation, so the dispatch
++    -- hit a null entry point and died with SIGSEGV. The flash-attn dependent
++    -- files keep their own ENABLE_FLASH_ATTN guard and compile to empty
++    -- translation units when the library is absent.
++    if has_config("hygon-dcu") then
++        if get_config("flash-attn") and get_config("flash-attn") ~= "" then
++            add_files("src/infinicore/adaptor/flash_attn/hygon/*.cc")
++        end
+     else
+         remove_files("src/infinicore/ops/*/hygon/*.cc")
+     end
+@@ -1086,7 +1109,15 @@ target("_infinicore")
+ 
+     set_default(false)
+     add_rules("python.library", {soabi = true})
+-    add_packages("pybind11")
++    -- Offline base images may ship the interpreter without a python*-config on
++    -- PATH; expose the headers explicitly when provided.
++    local python_include = os.getenv("PYTHON_INCLUDE")
++    if python_include and os.isdir(python_include) then
++        add_includedirs(python_include, {public = true})
++    end
++    if not pybind11_include then
++        add_packages("pybind11")
++    end
+     set_languages("cxx17")
+ 
+     add_deps("infinicore_cpp_api")
+diff --git a/xmake/hygon.lua b/xmake/hygon.lua
+index ba06ae9..803185c 100644
+--- a/xmake/hygon.lua
++++ b/xmake/hygon.lua
+@@ -156,7 +156,10 @@ target("infiniop-hygon")
+     remove_files("../src/infiniop/ops/histc/nvidia/*.cu")
+     remove_files("../src/infiniop/ops/quant/per_tensor_quant_int8/nvidia/*.cu")
+     if has_config("ninetoothed") then
++        -- NineToothed's CUDA backend emits plain CUDA C kernels, which DTK's
++        -- compiler builds for the Hygon target alongside the hand-written ones.
+         add_files("../build/ninetoothed/*.c", "../build/ninetoothed/*.cpp", {cxxflags = {"-Wno-return-type"}})
++        add_files("../build/ninetoothed/*.cu")
+     end
+ target_end()
+ 

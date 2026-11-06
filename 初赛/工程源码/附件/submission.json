@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "candidate": "r10-pre-submission",
+  "readiness": "NOT_CLEARED",
+  "official_result": "NOT_ISSUED",
+  "source_archive_sha256": "b6cbebac036ccdcaeaf77a05ee4d4258d5aa0bc279e1aaf1d427f27f2e743125",
+  "normal_entry_sha256": "aeac125c3327c88cf7e19f189648d37e9557c23f27f75e4c1ae623810b48714f",
+  "designated_bases": {
+    "InfiniCore": "f32e2fbb2a9b2ca912b5711f4f3836c403196a74",
+    "InfiniLM": "65deb91f840ebaef752d028fad2f3217ce0950f4"
+  },
+  "generation_config": {
+    "task": "native",
+    "first_frame_sha256": "1e71abf29876f248088a11211a350ed3d26a0c68aa34f6e45738771eb2d45a22",
+    "height": 928,
+    "width": 768,
+    "steps": 50,
+    "frames": 124,
+    "seed": 42,
+    "fps": 24,
+    "audio_output": true,
+    "prompt": "A dog falls asleep",
+    "source_archive_sha256": "b6cbebac036ccdcaeaf77a05ee4d4258d5aa0bc279e1aaf1d427f27f2e743125"
+  },
+  "runtime_inputs": [
+    {
+      "package_path": "附件/source/fl2va_source_20261105_r10.tar.gz",
+      "store_path": "fl2va_source_20261105_r10.tar.gz"
+    },
+    {
+      "package_path": "附件/offline/build_tool_xmake.tar.gz",
+      "store_path": "build_tool_xmake.tar.gz"
+    },
+    {
+      "package_path": "附件/offline/python_deps_base.tar.gz",
+      "store_path": "python_deps_base.tar.gz"
+    },
+    {
+      "package_path": "附件/offline/python_deps_models.tar.gz",
+      "store_path": "python_deps_models.tar.gz"
+    },
+    {
+      "package_path": "附件/offline/python_deps_metrics.tar.gz",
+      "store_path": "python_deps_metrics.tar.gz"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/triton_dtk2604.whl",
+      "store_path": "flash_attention/triton_dtk2604.whl"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part00",
+      "store_path": "flash_attention/flash_attention.whl.part00"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part01",
+      "store_path": "flash_attention/flash_attention.whl.part01"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part02",
+      "store_path": "flash_attention/flash_attention.whl.part02"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part03",
+      "store_path": "flash_attention/flash_attention.whl.part03"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part04",
+      "store_path": "flash_attention/flash_attention.whl.part04"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part05",
+      "store_path": "flash_attention/flash_attention.whl.part05"
+    },
+    {
+      "package_path": "附件/offline/flash_attention/flash_attention.whl.part06",
+      "store_path": "flash_attention/flash_attention.whl.part06"
+    }
+  ],
+  "official_similarity_threshold": null,
+  "weights_and_organizer_input_data_included": false,
+  "known_limits": [
+    "VAE第三方模型计算路径未取得适用明确许可",
+    "海光实际调用九齿的证据不足",
+    "官方相似度通过阈值未公开",
+    "已在平台AFS八卡环境完成一次build-core→build-lm→native分阶段重建",
+    "条件编码有非确定性，严格逐像素一致不是赛题默认要求",
+    "稳态性能、全量GPU资源和连续多样例尚未验收"
+  ],
+  "user_entry": "run.sh",
+  "default_action": null,
+  "ui_simplified": true,
+  "stages": [
+    "build-core",
+    "build-lm",
+    "native",
+    "check"
+  ],
+  "persistent_state": "${IFAB_AFS_HOME:-HOME}/fl2va-r10-submission",
+  "stage_budget_seconds": 1620,
+  "termination_grace_seconds": 45
+}

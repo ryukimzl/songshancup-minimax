@@ -1,0 +1,2911 @@
+diff --git a/csrc/models/minimax_h3/minimax_h3_transformer.cpp b/csrc/models/minimax_h3/minimax_h3_transformer.cpp
+index 4751213..b975c41 100644
+--- a/csrc/models/minimax_h3/minimax_h3_transformer.cpp
++++ b/csrc/models/minimax_h3/minimax_h3_transformer.cpp
+@@ -3,6 +3,7 @@
+ #include "../../global_state/global_state.hpp"
+ #include "../models_registry.hpp"
+ 
++#include <infinicore/dtype.hpp>
+ #include <infinicore/ops/add.hpp>
+ #include <infinicore/ops/cast.hpp>
+ #include <infinicore/ops/distributed/allgather.hpp>
+@@ -16,14 +17,175 @@
+ #include <infinicore/ops/timestep_embedding.hpp>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
+ #include <stdexcept>
+ #include <string>
+ #include <tuple>
+ #include <utility>
+ #include <vector>
+ 
++#include <infinicore/context/context.hpp>
++
++// 阶段打点：默认关闭，设 H3_TRACE=1 才输出。
++// 每层每步二十多条 fprintf + fflush，一次 50 步的作业能写三十多万行，
++// 既淹没日志，也给计时带上不必要的开销。排查时才打开。
++namespace {
++inline bool trace_enabled() {
++    static const bool enabled = std::getenv("H3_TRACE") != nullptr;
++    return enabled;
++}
++
++// 逐层指纹：H3_FP=1 时，把每个 block 的输出整块搬到 host 上算一个 FNV 哈希。
++// 目的不是"看出差多少"，而是"看出从第几层开始不一样"——50 层拼起来不确定，
++// 但每一层的输入输出都可以单独比对，第一个对不上的地方就是分岔点。
++// 这里每次调用都读一遍 getenv（不做 static），探针才能在两次重放之间才把它打开。
++// RankWorkers execute concurrently, including when fingerprinting is disabled.
++thread_local int g_fp_block = -1;
++
++// Retain the historical host-side mrope lock for now. Descriptors are actually
++// thread-local (INFINIOP_CACHABLE_DESCRIPTOR); this lock neither establishes a
++// kernel root cause nor rules out asynchronous device-side races.
++std::mutex g_mrope_mutex;
++
++inline bool fp_enabled() {
++    return std::getenv("H3_FP") != nullptr;
++}
++
++void fp_dump(const char *stage, const infinicore::Tensor &t) {
++    if (!fp_enabled() || !t) {
++        return;
++    }
++    // 二进制自报版本：上一轮就是靠"源码指纹没变"才发现跑的是旧库，
++    // 但那是脚本层面的证据，日志里再留一条来自二进制本身的。
++    static thread_local bool banner_done = false;
++    if (!banner_done) {
++        banner_done = true;
++        std::fprintf(stderr, "[h3-fp] fp-version 5 (mrope-locked)\n");
++        std::fflush(stderr);
++    }
++    // to(cpu) 是异步的：不先同步就去读 host 指针，读到的是还没写完的内存，
++    // 哈希因此是噪声，而且 host 缓冲在拷贝完成前被释放会把内存写坏。
++    // 第一次插桩就是这样把输出读成了 NaN。
++    infinicore::context::syncDevice();
++    auto host = t->contiguous()->to(infinicore::Device::cpu());
++    infinicore::context::syncDevice();
++    const size_t bytes = host->numel() * infinicore::dsize(host->dtype());
++    const unsigned char *p = reinterpret_cast<const unsigned char *>(host->data());
++    unsigned long long h = 1469598103934665603ULL;
++    for (size_t i = 0; i < bytes; ++i) {
++        h ^= p[i];
++        h *= 1099511628211ULL;
++    }
++    std::fprintf(stderr, "[h3-fp] b%d.%s %016llx\n", g_fp_block, stage, h);
++    std::fflush(stderr);
++}
++
++// 层内子阶段只对最前面两层打点：先定位到层，再细看是哪一步开始分岔。
++void fp_stage(const char *stage, const infinicore::Tensor &t) {
++    if (g_fp_block >= 0 && g_fp_block <= 1) {
++        fp_dump(stage, t);
++    }
++}
++} // namespace
++
++#define H3_TRACE(stage)                                                        \
++    do {                                                                       \
++        if (trace_enabled()) {                                                 \
++            std::fprintf(stderr, "[h3-trace] %s\n", stage);                    \
++            std::fflush(stderr);                                               \
++        }                                                                      \
++    } while (0)
++
++// 分阶段计时：H3_STAGE=1 时开启，进程退出时打一张表。
++// 每个阶段前后各同步一次流，把异步队列上的耗时归到正确的阶段；
++// 同步本身有开销，所以只用于剖析，正式计时不要开。
++namespace {
++
++inline bool stage_profile_enabled() {
++    static const bool enabled = std::getenv("H3_STAGE") != nullptr;
++    return enabled;
++}
++
++// 只剖析第一遍前向（前 kProfileBlockLimit 个 block），计满即停。
++// 上一版全程计时：每个阶段前后各同步一次流，一次作业累积上万次同步，
++// 报出来的总和（201.8 秒）比外层实测的 26.96 秒还大十几倍，自相矛盾。
++// 限定在一遍前向内，block 数应当恰好等于层数，总和应当对得上单次前向耗时，
++// 这样这张表本身就能自证真假。
++constexpr long kProfileBlockLimit = 50;
++
++struct StageProfile {
++    double block = 0, qkv = 0, qk_norm = 0, mrope = 0, mha = 0, o_proj = 0, mlp = 0;
++    long blocks = 0;
++    bool done = false;
++    size_t seq = 0;
++
++    ~StageProfile() {
++        if (!stage_profile_enabled() || blocks == 0) {
++            return;
++        }
++        const double measured = qkv + qk_norm + mrope + mha + o_proj + mlp;
++        const double other = block > measured ? block - measured : 0.0;
++        if (block <= 0) {
++            return;
++        }
++        auto pct = [this](double v) { return 100.0 * v / block; };
++        std::fprintf(stderr, "[h3-stage] seq=%zu timed_blocks=%ld block_total=%.2f s\n",
++                     seq, blocks, block);
++        std::fprintf(stderr, "[h3-stage]   qkv_proj %9.2f s %5.1f%%\n", qkv, pct(qkv));
++        std::fprintf(stderr, "[h3-stage]   qk_norm  %9.2f s %5.1f%%\n", qk_norm, pct(qk_norm));
++        std::fprintf(stderr, "[h3-stage]   mrope    %9.2f s %5.1f%%\n", mrope, pct(mrope));
++        std::fprintf(stderr, "[h3-stage]   mha      %9.2f s %5.1f%%\n", mha, pct(mha));
++        std::fprintf(stderr, "[h3-stage]   o_proj   %9.2f s %5.1f%%\n", o_proj, pct(o_proj));
++        std::fprintf(stderr, "[h3-stage]   mlp      %9.2f s %5.1f%%\n", mlp, pct(mlp));
++        std::fprintf(stderr, "[h3-stage]   other    %9.2f s %5.1f%%\n", other, pct(other));
++        std::fflush(stderr);
++    }
++};
++
++inline StageProfile &stage_profile() {
++    static thread_local StageProfile profile;
++    return profile;
++}
++
++inline bool profiling_on() {
++    return stage_profile_enabled() && !stage_profile().done;
++}
++
++class StageTimer {
++public:
++    explicit StageTimer(double &slot) : slot_(slot), enabled_(profiling_on()) {
++        if (!enabled_) {
++            return;
++        }
++        infinicore::context::syncStream();
++        started_ = std::chrono::steady_clock::now();
++    }
++    ~StageTimer() {
++        if (!enabled_) {
++            return;
++        }
++        infinicore::context::syncStream();
++        slot_ += std::chrono::duration<double>(
++                     std::chrono::steady_clock::now() - started_)
++                     .count();
++    }
++    StageTimer(const StageTimer &) = delete;
++    StageTimer &operator=(const StageTimer &) = delete;
++
++private:
++    double &slot_;
++    bool enabled_;
++    std::chrono::steady_clock::time_point started_{};
++};
++
++} // namespace
++
++
+ namespace infinilm::models::minimax_h3 {
+ namespace {
+ 
+@@ -54,8 +216,15 @@ infinicore::Tensor gather_rows(const infinicore::Tensor &table,
+ infinicore::Tensor apply_adaln(const infinicore::Tensor &normalized,
+                                const infinicore::Tensor &scale,
+                                const infinicore::Tensor &shift) {
+-    auto scaled = infinicore::op::mul(normalized, scale);
+-    return infinicore::op::add(infinicore::op::add(normalized, scaled), shift);
++    // Match Diffusers' operation boundaries: BF16 rounds after 1 + scale,
++    // then after multiplication. normalized + normalized * scale is not
++    // equivalent at this precision. Broadcast one scalar, not a full tensor.
++    auto one = infinicore::Tensor::ones({1}, scale->dtype(), scale->device());
++    // InfiniCore Add requires equal logical shapes. A zero-stride view shares
++    // the scalar storage while satisfying that contract.
++    auto ones = one->as_strided(scale->shape(), infinicore::Strides(scale->shape().size(), 0));
++    auto scale_plus_one = infinicore::op::add(scale, ones);
++    return infinicore::op::add(infinicore::op::mul(normalized, scale_plus_one), shift);
+ }
+ 
+ void require_tensor(const std::optional<infinicore::Tensor> &tensor,
+@@ -122,15 +291,29 @@ infinicore::Tensor MiniMaxH3Attention::forward(
+     const size_t sequence_length = hidden_states->size(1);
+ 
+     auto hidden_states_mutable = hidden_states;
+-    auto [query, key, value] = qkv_proj_->forward_split(hidden_states_mutable);
++    stage_profile().seq = sequence_length;
++    infinicore::Tensor query, key, value;
++    H3_TRACE("attn:qkv_proj:begin");
++    {
++        StageTimer timer(stage_profile().qkv);
++        std::tie(query, key, value) = qkv_proj_->forward_split(hidden_states_mutable);
++    }
++    H3_TRACE("attn:qkv_proj:end");
++    fp_stage("qkv", query);
+     query = query->view({batch_size * sequence_length, num_heads_, head_dim_});
+     key = key->view({batch_size * sequence_length, num_heads_, head_dim_});
+     value = value->view({batch_size, sequence_length, num_heads_, head_dim_});
+ 
+-    query = norm_q_->forward(query);
+-    key = norm_k_->forward(key);
++    H3_TRACE("attn:qk_norm:begin");
++    {
++        StageTimer timer(stage_profile().qk_norm);
++        query = norm_q_->forward(query);
++        key = norm_k_->forward(key);
++    }
++    H3_TRACE("attn:qk_norm:end");
+     query = query->view({batch_size, sequence_length, num_heads_, head_dim_});
+     key = key->view({batch_size, sequence_length, num_heads_, head_dim_});
++    fp_stage("qknorm", query);
+ 
+     if (rotary_cos_sin_cache.has_value()) {
+         if (!position_ids.has_value()) {
+@@ -153,10 +336,25 @@ infinicore::Tensor MiniMaxH3Attention::forward(
+         auto sin = cache->narrow({{1, half_rotary_dim, half_rotary_dim}});
+         auto query_flat = query->squeeze(0)->view({sequence_length, num_heads_ * head_dim_});
+         auto key_flat = key->squeeze(0)->view({sequence_length, num_heads_ * head_dim_});
+-        std::tie(query_flat, key_flat) = infinicore::op::mrope(
+-            query_flat, key_flat, cos, sin, position_ids.value(),
+-            static_cast<int>(head_dim_), static_cast<int>(rotary_dim), section,
+-            section, section, false);
++        H3_TRACE("attn:mrope:begin");
++        // mrope 的输入输出紧挨着各打一次：如果 in 相同而 out 不同，
++        // 就是算子本身对同一份输入给不出同一个结果，不用再往上下游找。
++        fp_stage("mrope_in_q", query_flat);
++        fp_stage("mrope_in_k", key_flat);
++        if (g_fp_block == 0) {
++            fp_dump("rope.cos", cos);
++            fp_dump("rope.sin", sin);
++            fp_dump("rope.pos", position_ids.value());
++        }
++        {
++            StageTimer timer(stage_profile().mrope);
++            std::lock_guard<std::mutex> guard(g_mrope_mutex);
++            std::tie(query_flat, key_flat) = infinicore::op::mrope(
++                query_flat, key_flat, cos, sin, position_ids.value(),
++                static_cast<int>(head_dim_), static_cast<int>(rotary_dim), section,
++                section, section, false);
++        }
++        H3_TRACE("attn:mrope:end");
+         query = query_flat->view({batch_size, sequence_length, num_heads_, head_dim_});
+         key = key_flat->view({batch_size, sequence_length, num_heads_, head_dim_});
+     } else if (rope != nullptr) {
+@@ -174,9 +372,27 @@ infinicore::Tensor MiniMaxH3Attention::forward(
+         query = query_squeezed->unsqueeze(0);
+         key = key_squeezed->unsqueeze(0);
+     }
+-    auto output = infinicore::op::mha(query, key, value, std::nullopt, scale_, false);
++    fp_stage("mrope_q", query);
++    fp_stage("mrope_k", key);
++    fp_stage("v", value);
++    H3_TRACE("attn:mha:begin");
++    infinicore::Tensor output;
++    {
++        StageTimer timer(stage_profile().mha);
++        output = infinicore::op::mha(query, key, value, std::nullopt, scale_, false);
++    }
++    H3_TRACE("attn:mha:end");
++    fp_stage("mha", output);
+     output = output->view({batch_size, sequence_length, inner_dim_});
+-    return linear_forward(out_proj_, output);
++    H3_TRACE("attn:o_proj:begin");
++    infinicore::Tensor result;
++    {
++        StageTimer timer(stage_profile().o_proj);
++        result = linear_forward(out_proj_, output);
++    }
++    H3_TRACE("attn:o_proj:end");
++    fp_stage("oproj", result);
++    return result;
+ }
+ 
+ void MiniMaxH3Attention::process_weights_after_loading() {
+@@ -240,6 +456,7 @@ MiniMaxH3TokenRefinerBlock::MiniMaxH3TokenRefinerBlock(
+ 
+ infinicore::Tensor MiniMaxH3TokenRefinerBlock::forward(
+     const infinicore::Tensor &hidden_states) const {
++    H3_TRACE("block:attn:begin");
+     auto attention_output = attn_->forward(norm1_->forward(hidden_states));
+     auto output = infinicore::op::add(hidden_states, attention_output);
+     auto mlp_output = ff_->forward(norm2_->forward(output));
+@@ -324,9 +541,20 @@ infinicore::Tensor MiniMaxH3TransformerBlock::forward(
+     const std::shared_ptr<infinicore::nn::RoPE> &rope,
+     const infinicore::Tensor &position_ids,
+     const std::optional<infinicore::Tensor> &rotary_cos_sin_cache) const {
++    if (stage_profile_enabled() && !stage_profile().done) {
++        if (stage_profile().blocks >= kProfileBlockLimit) {
++            stage_profile().done = true;
++        } else {
++            stage_profile().blocks++;
++        }
++    }
++    StageTimer block_timer(stage_profile().block);
++    H3_TRACE("block:adaln_proj");
+     auto modulation = adaln_proj_->forward(temb)->view(
+         {temb->size(0) * H3_MODALITY_COUNT, 6 * hidden_size_});
++    H3_TRACE("block:gather_rows");
+     auto token_modulation = gather_rows(modulation, adaln_indices)->unsqueeze(0);
++    fp_stage("mod", token_modulation);
+     auto shift_msa = token_modulation->narrow({{2, 0, hidden_size_}});
+     auto scale_msa = token_modulation->narrow({{2, hidden_size_, hidden_size_}});
+     auto gate_msa = token_modulation->narrow({{2, 2 * hidden_size_, hidden_size_}});
+@@ -334,15 +562,26 @@ infinicore::Tensor MiniMaxH3TransformerBlock::forward(
+     auto scale_mlp = token_modulation->narrow({{2, 4 * hidden_size_, hidden_size_}});
+     auto gate_mlp = token_modulation->narrow({{2, 5 * hidden_size_, hidden_size_}});
+ 
++    H3_TRACE("block:norm1");
+     auto normalized = norm1_->forward(hidden_states);
+     normalized = apply_adaln(normalized, scale_msa, shift_msa);
++    fp_stage("norm1", normalized);
+     auto attention_output = attn_->forward(normalized, rope, position_ids, rotary_cos_sin_cache);
++    H3_TRACE("block:attn:end");
+     auto output = infinicore::op::add(
+         hidden_states, infinicore::op::mul(gate_msa, attention_output));
+ 
++    H3_TRACE("block:norm2");
+     normalized = norm2_->forward(output);
+     normalized = apply_adaln(normalized, scale_mlp, shift_mlp);
+-    auto mlp_output = ff_->forward(normalized);
++    H3_TRACE("block:mlp:begin");
++    infinicore::Tensor mlp_output;
++    {
++        StageTimer timer(stage_profile().mlp);
++        mlp_output = ff_->forward(normalized);
++    }
++    H3_TRACE("block:mlp:end");
++    fp_stage("mlp", mlp_output);
+     output = infinicore::op::add(output, infinicore::op::mul(gate_mlp, mlp_output));
+     return output;
+ }
+@@ -519,6 +758,7 @@ InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
+                                  "currently supports batch size 1");
+     }
+ 
++    H3_TRACE("tf:proj_in:begin");
+     auto video_input = cast_to(video_hidden_states, infinicore::DataType::F32);
+     auto audio_input = cast_to(audio_hidden_states, infinicore::DataType::F32);
+     auto text_input = cast_to(encoder_hidden_states, dtype_);
+@@ -526,7 +766,11 @@ InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
+     auto audio_embeds = cast_to(linear_forward(audio_proj_in_, audio_input), dtype_);
+     auto context_embeds = linear_forward(context_embedder_, text_input);
+     auto text_embeds = token_refiner_->forward(context_embeds);
++    fp_dump("emb.video", video_embeds);
++    fp_dump("emb.audio", audio_embeds);
++    fp_dump("emb.text_refined", text_embeds);
+ 
++    H3_TRACE("tf:embed:end");
+     auto hidden_states = infinicore::Tensor::zeros(
+         {1, sequence_length, hidden_size_}, dtype_, text_embeds->device());
+     hidden_states = infinicore::op::index_copy(
+@@ -536,24 +780,37 @@ InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
+     hidden_states = infinicore::op::index_copy(
+         hidden_states, 1, input.audio_indices.value(), audio_embeds);
+ 
++    H3_TRACE("tf:index_copy:end");
+     auto temb = time_embedder_->forward(input.timestep.value());
+     auto timestep_indices = input.timestep_indices.value();
+     auto token_tags = input.token_tags.value();
+     auto timestep_indices_x2 = infinicore::op::add(timestep_indices, timestep_indices);
+     auto timestep_indices_x3 = infinicore::op::add(timestep_indices_x2, timestep_indices);
++    H3_TRACE("tf:adaln_indices");
+     auto adaln_indices = infinicore::op::add(timestep_indices_x3, token_tags);
+     auto rope_positions = has_rotary_cache ? position_ids : position_ids->permute({1, 0});
+ 
++    H3_TRACE("tf:blocks:begin");
++    fp_dump("input", hidden_states);
+     for (size_t i = 0; i < transformer_blocks_.size(); ++i) {
++        if (trace_enabled()) {
++            std::fprintf(stderr, "[h3-trace] tf:block %zu/%zu begin\n", i, transformer_blocks_.size());
++            std::fflush(stderr);
++        }
++        g_fp_block = static_cast<int>(i);
+         hidden_states = transformer_blocks_[i]->forward(
+             hidden_states, temb, adaln_indices, rope_, rope_positions,
+             input.rotary_cos_sin_cache);
++        fp_dump("out", hidden_states);
+     }
++    g_fp_block = -1;
+ 
++    H3_TRACE("tf:blocks:end");
+     auto normalized = norm_out_->forward(hidden_states, temb, timestep_indices);
+     auto normalized_f32 = cast_to(normalized, infinicore::DataType::F32);
+     auto video_all = linear_forward(proj_out_, normalized_f32)->squeeze(0);
+     auto audio_all = linear_forward(audio_proj_out_, normalized_f32)->squeeze(0);
++    H3_TRACE("tf:proj_out:end");
+     auto video_output = gather_rows(video_all, input.video_indices.value())->unsqueeze(0);
+     auto audio_output = gather_rows(audio_all, input.audio_indices.value())->unsqueeze(0);
+     return {video_output, audio_output};
+diff --git a/csrc/models/qwen3_5/qwen3_5_vision.cpp b/csrc/models/qwen3_5/qwen3_5_vision.cpp
+index fb19cae..875ca20 100644
+--- a/csrc/models/qwen3_5/qwen3_5_vision.cpp
++++ b/csrc/models/qwen3_5/qwen3_5_vision.cpp
+@@ -1,7 +1,9 @@
+ #include "qwen3_5_vision.hpp"
++#include "../qwen3_vl/condition_trace.hpp"
+ 
+ #include "../../utils.hpp"
+ 
++#include <infinicore/context/context.hpp>
+ #include <infinicore/ops.hpp>
+ #include <infinicore/ops/mha.hpp>
+ #include <infinicore/ops/upsample_bilinear.hpp>
+@@ -17,6 +19,7 @@
+ #include <vector>
+ 
+ namespace infinilm::models::qwen3_5 {
++namespace ct = infinilm::models::condition_trace;
+ namespace {
+ 
+ size_t get_size_or_first(const nlohmann::json &config, const char *key,
+@@ -127,7 +130,9 @@ infinicore::Tensor Qwen35VisionAttention::forward(
+     const size_t seq_len = hidden_states->size(0);
+     const size_t axis_head_dim = head_dim_ / 2;
+     auto hidden_mut = hidden_states;
++    ct::record("attention.input", hidden_states);
+     auto qkv = qkv_->forward(hidden_mut)->view({seq_len, 3, num_heads_, head_dim_});
++    ct::record("attention.qkv", qkv);
+     auto q = qkv->narrow({{1, 0, 1}})->squeeze(1)->contiguous();
+     auto k = qkv->narrow({{1, 1, 1}})->squeeze(1)->contiguous();
+     auto v = qkv->narrow({{1, 2, 1}})->squeeze(1)->contiguous()->unsqueeze(0);
+@@ -148,8 +153,12 @@ infinicore::Tensor Qwen35VisionAttention::forward(
+             ->copy_from(
+                 x->narrow({{2, axis_head_dim + axis_pair_dim, axis_pair_dim}}));
+ 
++        ct::record("row.before_rope", row);
++        ct::record("col.before_rope", col);
+         rotary_emb_->forward(row, row_position_ids, true);
++        ct::record("row.after_rope", row);
+         rotary_emb_->forward(col, col_position_ids, true);
++        ct::record("col.after_rope", col);
+ 
+         x->narrow({{2, 0, axis_pair_dim}})
+             ->copy_from(row->narrow({{2, 0, axis_pair_dim}}));
+@@ -160,13 +169,19 @@ infinicore::Tensor Qwen35VisionAttention::forward(
+         x->narrow({{2, axis_head_dim + axis_pair_dim, axis_pair_dim}})
+             ->copy_from(col->narrow({{2, axis_pair_dim, axis_pair_dim}}));
+     };
+-    apply_2d_rope(q);
+-    apply_2d_rope(k);
++    { ct::Scope scope("attention.q."); apply_2d_rope(q); }
++    { ct::Scope scope("attention.k."); apply_2d_rope(k); }
++    ct::record("attention.q.rope_reassembled", q);
++    ct::record("attention.k.rope_reassembled", k);
++    ct::record("attention.v", v);
+ 
+     auto out = infinicore::op::mha(q->unsqueeze(0), k->unsqueeze(0), v,
+                                    std::nullopt, scale_, false)
+                    ->view({seq_len, hidden_size_});
+-    return proj_->forward(out);
++    ct::record("attention.mha", out);
++    auto projected = proj_->forward(out);
++    ct::record("attention.projection", projected);
++    return projected;
+ }
+ 
+ Qwen35VisionMLP::Qwen35VisionMLP(const nlohmann::json &config,
+@@ -185,13 +200,17 @@ infinicore::Tensor
+ Qwen35VisionMLP::forward(const infinicore::Tensor &hidden_states) const {
+     auto hidden_mut = hidden_states;
+     auto x = linear_fc1_->forward(hidden_mut);
++    ct::record("mlp.fc1", x);
+     if (activation_ == "gelu" || activation_ == "gelu_pytorch_tanh") {
+         x = activation_ == "gelu" ? infinicore::op::gelu(x)
+                                   : infinicore::op::gelu_tanh(x);
+     } else {
+         throw std::runtime_error("Qwen35VisionMLP: unsupported activation " + activation_);
+     }
+-    return linear_fc2_->forward(x);
++    ct::record("mlp.activation", x);
++    auto result = linear_fc2_->forward(x);
++    ct::record("mlp.fc2", result);
++    return result;
+ }
+ 
+ Qwen35VisionBlock::Qwen35VisionBlock(const nlohmann::json &config,
+@@ -209,13 +228,19 @@ infinicore::Tensor
+ Qwen35VisionBlock::forward(const infinicore::Tensor &hidden_states,
+                            const infinicore::Tensor &row_position_ids,
+                            const infinicore::Tensor &col_position_ids) const {
++    ct::record("block.input", hidden_states);
+     auto x = norm1_->forward(hidden_states);
++    ct::record("block.norm1", x);
+     x = attn_->forward(x, row_position_ids, col_position_ids);
+     x = infinicore::op::add(x, hidden_states);
+     auto residual = x;
++    ct::record("block.residual1", x);
+     x = norm2_->forward(x);
++    ct::record("block.norm2", x);
+     x = mlp_->forward(x);
+-    return infinicore::op::add(x, residual);
++    auto result = infinicore::op::add(x, residual);
++    ct::record("block.output", result);
++    return result;
+ }
+ 
+ Qwen35VisionPatchMerger::Qwen35VisionPatchMerger(
+@@ -245,8 +270,12 @@ infinicore::Tensor Qwen35VisionPatchMerger::forward(
+                      ->view({hidden_states->size(0) / (merged_size_ / hidden_size_),
+                              merged_size_});
+     x = linear_fc1_->forward(x);
++    ct::record("merger.fc1", x);
+     x = infinicore::op::gelu(x);
+-    return linear_fc2_->forward(x);
++    ct::record("merger.activation", x);
++    auto result = linear_fc2_->forward(x);
++    ct::record("merger.fc2", result);
++    return result;
+ }
+ 
+ Qwen35VisionModel::Qwen35VisionModel(const nlohmann::json &config,
+@@ -368,7 +397,13 @@ infinicore::Tensor Qwen35VisionModel::build_rotary_position_ids(
+             }
+         }
+     }
+-    return position_ids_cpu->to(image_grid_thw->device());
++    auto position_ids_device = position_ids_cpu->to(image_grid_thw->device());
++    // Tensor::to enqueues an asynchronous H2D copy. Keep the CPU owner alive
++    // until this stream has consumed it; later forward waits are too late.
++    if (image_grid_thw->device() != infinicore::Device::cpu()) {
++        infinicore::context::syncStream();
++    }
++    return position_ids_device;
+ }
+ 
+ infinicore::Tensor
+@@ -381,27 +416,34 @@ Qwen35VisionOutput Qwen35VisionModel::forward_with_deepstack(
+     const infinicore::Tensor &pixel_values,
+     const infinicore::Tensor &image_grid_thw) const {
+     auto hidden_states = patch_embed_->forward(pixel_values);
++    ct::record("vision.patch_embedding", hidden_states);
+     auto pos_embeds = fast_pos_embed_interpolate(image_grid_thw);
++    ct::record("vision.position_embedding", pos_embeds);
+     hidden_states = infinicore::op::add(hidden_states, pos_embeds);
++    ct::record("vision.embedding_sum", hidden_states);
+ 
+     auto position_ids = build_rotary_position_ids(image_grid_thw);
++    ct::record("vision.rotary_positions", position_ids);
+     auto row_position_ids = position_ids->narrow({{0, 0, 1}})->view({position_ids->size(1)});
+     auto col_position_ids = position_ids->narrow({{0, 1, 1}})->view({position_ids->size(1)});
+ 
+     std::vector<infinicore::Tensor> deepstack_features;
+     deepstack_features.reserve(deepstack_visual_indexes_.size());
+     for (size_t layer_idx = 0; layer_idx < blocks_.size(); ++layer_idx) {
++        ct::Scope block_scope("vision.block." + std::to_string(layer_idx) + ".");
+         hidden_states = blocks_[layer_idx]->forward(hidden_states, row_position_ids,
+                                                     col_position_ids);
+         auto it = std::find(deepstack_visual_indexes_.begin(),
+                             deepstack_visual_indexes_.end(), layer_idx);
+         if (it != deepstack_visual_indexes_.end()) {
++            ct::Scope merger_scope("deepstack_merger.");
+             const size_t merger_idx = static_cast<size_t>(
+                 std::distance(deepstack_visual_indexes_.begin(), it));
+             deepstack_features.push_back(
+                 deepstack_merger_list_[merger_idx]->forward(hidden_states));
+         }
+     }
++    ct::Scope merger_scope("vision.final_merger.");
+     return {merger_->forward(hidden_states), std::move(deepstack_features)};
+ }
+ 
+diff --git a/csrc/models/qwen3_vl/condition_trace.hpp b/csrc/models/qwen3_vl/condition_trace.hpp
+new file mode 100644
+index 0000000..3d170c6
+--- /dev/null
++++ b/csrc/models/qwen3_vl/condition_trace.hpp
+@@ -0,0 +1,126 @@
++#pragma once
++
++#include "../../global_state/global_state.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/tensor.hpp>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++// Host-side diagnostics only. Disabled by default; never changes model values.
++namespace infinilm::models::condition_trace {
++struct Snapshot {
++    int dtype;
++    std::string shape;
++    std::vector<unsigned char> bytes;
++};
++struct State {
++    bool active = false;
++    int run = 0, rank = -1;
++    size_t compared = 0, differences = 0;
++    bool io_error = false;
++    std::string directory, prefix, first;
++    FILE *file = nullptr;
++    std::unordered_map<std::string, size_t> counts;
++    std::unordered_map<std::string, Snapshot> baseline;
++};
++inline State &state() { static thread_local State value; return value; }
++inline bool requested() {
++    const char *flag = std::getenv("H3_CONDITION_TRACE");
++    return flag && std::strcmp(flag, "1") == 0;
++}
++inline void begin() {
++    auto &s = state();
++    s.active = requested();
++    if (!s.active) { return; }
++    const char *run = std::getenv("H3_CONDITION_TRACE_RUN");
++    const char *directory = std::getenv("H3_CONDITION_TRACE_DIR");
++    s.run = run ? std::atoi(run) : 0;
++    s.rank = global_state::get_tensor_model_parallel_rank_info().tp_rank;
++    s.active = directory && (s.run == 1 || s.run == 2);
++    if (!s.active) {
++        std::fprintf(stderr, "COND_TRACE_CONFIG_FAIL rank=%d\n", s.rank);
++        return;
++    }
++    s.directory = directory;
++    s.prefix.clear(); s.first.clear(); s.counts.clear();
++    s.compared = 0; s.differences = 0; s.io_error = false;
++    if (s.run == 1) { s.baseline.clear(); }
++    auto path = s.directory + "/rank-" + std::to_string(s.rank) + ".tsv";
++    s.file = std::fopen(path.c_str(), s.run == 1 ? "w" : "a");
++    if (!s.file) { s.io_error = true; }
++}
++struct Scope {
++    std::string previous;
++    bool active;
++    explicit Scope(const std::string &name) : active(state().active) {
++        if (active) { previous = state().prefix; state().prefix += name; }
++    }
++    ~Scope() { if (active) { state().prefix = previous; } }
++};
++inline bool save_bytes(const std::string &path, const std::vector<unsigned char> &bytes) {
++    auto *file = std::fopen(path.c_str(), "wb");
++    if (!file) { return false; }
++    const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
++    return std::fclose(file) == 0 && ok;
++}
++inline void record(const std::string &name, const infinicore::Tensor &tensor) {
++    auto &s = state();
++    if (!s.active) { return; }
++    if (!tensor) { return; }
++    auto packed = tensor->contiguous();
++    infinicore::context::syncStream();
++    auto cpu = packed->to(infinicore::Device::cpu());
++    // D2H is synchronous in the current runtime; the producer wait above is explicit.
++    Snapshot current;
++    current.dtype = static_cast<int>(cpu->dtype());
++    for (auto dim : cpu->shape()) { current.shape += std::to_string(dim) + ","; }
++    const auto *data = reinterpret_cast<const unsigned char *>(cpu->data());
++    if (cpu->nbytes()) { current.bytes.assign(data, data + cpu->nbytes()); }
++    const auto base = s.prefix + name;
++    const auto key = base + "@" + std::to_string(++s.counts[base]);
++    bool equal = true;
++    if (s.run == 1) {
++        s.baseline[key] = current;
++    } else {
++        ++s.compared;
++        auto found = s.baseline.find(key);
++        equal = found != s.baseline.end() && found->second.dtype == current.dtype
++                && found->second.shape == current.shape && found->second.bytes == current.bytes;
++        if (!equal) {
++            ++s.differences;
++            if (s.first.empty()) {
++                s.first = key;
++                std::fprintf(stderr, "COND_TRACE_FIRST_DIFF rank=%d stage=%s dtype=%d shape=%s bytes=%zu\n",
++                             s.rank, key.c_str(), current.dtype, current.shape.c_str(), current.bytes.size());
++                // Bound saved evidence; no model output is substituted with snapshots.
++                if (found != s.baseline.end() && found->second.bytes.size() <= 16*1024*1024
++                    && current.bytes.size() <= 16*1024*1024) {
++                    const auto prefix = s.directory + "/rank-" + std::to_string(s.rank);
++                    s.io_error |= !save_bytes(prefix + "-first-run1.bin", found->second.bytes);
++                    s.io_error |= !save_bytes(prefix + "-first-run2.bin", current.bytes);
++                }
++            }
++        }
++        if (found != s.baseline.end()) { s.baseline.erase(found); }
++    }
++    if (s.file && std::fprintf(s.file, "%d\t%d\t%s\t%d\t%d\t%s\t%zu\n", s.run, s.rank,
++                              key.c_str(), equal ? 1 : 0, current.dtype,
++                              current.shape.c_str(), current.bytes.size()) < 0) { s.io_error = true; }
++}
++inline void finish() {
++    auto &s = state();
++    if (!s.active) { return; }
++    const size_t remaining = s.baseline.size();
++    if (s.file) { s.io_error |= std::fclose(s.file) != 0; s.file = nullptr; }
++    std::fprintf(stderr, "COND_TRACE_SUMMARY run=%d rank=%d compared=%zu differences=%zu remaining=%zu io_error=%d first=%s\n",
++                 s.run, s.rank, s.compared, s.differences, remaining, int(s.io_error),
++                 s.first.empty() ? "none" : s.first.c_str());
++    if (s.run == 2) { s.baseline.clear(); }
++    s.active = false;
++}
++} // namespace infinilm::models::condition_trace
+diff --git a/csrc/models/qwen3_vl/qwen3_vl_attention.cpp b/csrc/models/qwen3_vl/qwen3_vl_attention.cpp
+index 3967499..fbf268d 100644
+--- a/csrc/models/qwen3_vl/qwen3_vl_attention.cpp
++++ b/csrc/models/qwen3_vl/qwen3_vl_attention.cpp
+@@ -1,4 +1,5 @@
+ #include "qwen3_vl_attention.hpp"
++#include "condition_trace.hpp"
+ 
+ #include "../../global_state/global_state.hpp"
+ #include "../../layers/attention/attention.hpp"
+@@ -12,6 +13,7 @@
+ #include <vector>
+ 
+ namespace infinilm::models::qwen3_vl {
++namespace ct = infinilm::models::condition_trace;
+ 
+ Qwen3VLAttention::Qwen3VLAttention(
+     std::shared_ptr<infinilm::config::ModelConfig> model_config,
+@@ -92,22 +94,32 @@ Qwen3VLAttention::forward(const infinicore::Tensor &positions,
+ infinicore::Tensor Qwen3VLAttention::forward_static_(
+     const infinicore::Tensor &position_ids,
+     const infinicore::Tensor &hidden_states) const {
++    ct::record("attention.input", hidden_states);
+     auto hidden_mutable = hidden_states;
+     const size_t batch_size = hidden_states->size(0);
+     const size_t seq_len = hidden_states->size(1);
+     auto [q, k, v] = qkv_proj_->forward_split(hidden_mutable);
++    ct::record("attention.qkv.q", q);
++    ct::record("attention.qkv.k", k);
++    ct::record("attention.qkv.v", v);
+ 
+     q = q_norm_->forward(
+         q->view({batch_size * seq_len, num_attention_heads_, head_dim_}));
+     k = k_norm_->forward(
+         k->view({batch_size * seq_len, num_key_value_heads_, head_dim_}));
++    ct::record("attention.q_norm", q);
++    ct::record("attention.k_norm", k);
+     std::tie(q, k) = mrope_->forward(q, k, position_ids);
++    ct::record("attention.q_rope", q);
++    ct::record("attention.k_rope", k);
+ 
+     auto q_reshaped = q->view({batch_size, seq_len, num_attention_heads_, head_dim_});
+     auto k_reshaped = k->view({batch_size, seq_len, num_key_value_heads_, head_dim_});
+     auto v_reshaped = v->view({batch_size, seq_len, num_key_value_heads_, head_dim_});
+     auto output = attn_->forward(q_reshaped, k_reshaped, v_reshaped);
++    ct::record("attention.context", output);
+     output = o_proj_->forward(output);
++    ct::record("attention.projection_allreduce", output);
+     return output;
+ }
+ 
+@@ -115,17 +127,28 @@ infinicore::Tensor Qwen3VLAttention::forward_paged_(
+     const infinicore::Tensor &position_ids,
+     const infinicore::Tensor &hidden_states) const {
+     ASSERT_EQ(hidden_states->size(0), 1);
++    ct::record("attention.input", hidden_states);
+     auto hidden_mutable = hidden_states;
+     const size_t seq_len = hidden_states->size(1);
+     auto [q, k, v] = qkv_proj_->forward_split(hidden_mutable);
++    ct::record("attention.qkv.q", q);
++    ct::record("attention.qkv.k", k);
++    ct::record("attention.qkv.v", v);
+ 
+     q = q_norm_->forward(q->view({seq_len, num_attention_heads_, head_dim_}));
+     k = k_norm_->forward(k->view({seq_len, num_key_value_heads_, head_dim_}));
++    ct::record("attention.q_norm", q);
++    ct::record("attention.k_norm", k);
+     std::tie(q, k) = mrope_->forward(q, k, position_ids);
++    ct::record("attention.q_rope", q);
++    ct::record("attention.k_rope", k);
+ 
+     auto v_reshaped = v->view({seq_len, num_key_value_heads_, head_dim_});
+     auto output = attn_->forward(q, k, v_reshaped);
+-    return o_proj_->forward(output);
++    ct::record("attention.context", output);
++    auto projected = o_proj_->forward(output);
++    ct::record("attention.projection_allreduce", projected);
++    return projected;
+ }
+ 
+ } // namespace infinilm::models::qwen3_vl
+diff --git a/csrc/models/qwen3_vl/qwen3_vl_for_conditional_generation.cpp b/csrc/models/qwen3_vl/qwen3_vl_for_conditional_generation.cpp
+index 6e4cad7..48d85d4 100644
+--- a/csrc/models/qwen3_vl/qwen3_vl_for_conditional_generation.cpp
++++ b/csrc/models/qwen3_vl/qwen3_vl_for_conditional_generation.cpp
+@@ -1,4 +1,5 @@
+ #include "qwen3_vl_for_conditional_generation.hpp"
++#include "condition_trace.hpp"
+ 
+ #include "../../global_state/global_state.hpp"
+ #include "../models_registry.hpp"
+@@ -10,6 +11,7 @@
+ #include <vector>
+ 
+ namespace infinilm::models::qwen3_vl {
++namespace ct = infinilm::models::condition_trace;
+ namespace {
+ 
+ std::vector<int64_t> tensor_to_i64_vector(const infinicore::Tensor &tensor) {
+@@ -91,6 +93,7 @@ Qwen3VLModel::forward(const infinilm::InfinilmModel::Input &input) const {
+ 
+     const auto offsets = tensor_to_i64_vector(input.input_offsets.value());
+     auto inputs_embeds = language_model_->embed_tokens(input.input_ids.value());
++    ct::record("fusion.text_embeddings", inputs_embeds);
+     std::vector<Qwen3VLDeepStackEmbedding> deepstack_embeddings;
+ 
+     for (size_t image_idx = 0; image_idx < pixels.size(); ++image_idx) {
+@@ -107,7 +110,15 @@ Qwen3VLModel::forward(const infinilm::InfinilmModel::Input &input) const {
+         const size_t request_start = static_cast<size_t>(offsets[request_id]);
+         const size_t request_length = static_cast<size_t>(offsets[request_id + 1] - offsets[request_id]);
+ 
++        ct::Scope image_scope("image." + std::to_string(image_idx) + ".");
++        ct::record("input.pixels", pixels[image_idx]);
++        ct::record("input.grid", grids[image_idx]);
++        ct::record("input.bounds", bounds[image_idx]);
+         auto vision_output = visual_->forward_with_deepstack(pixels[image_idx], grids[image_idx]);
++        ct::record("vision.pooled", vision_output.pooler_output);
++        for (size_t i = 0; i < vision_output.deepstack_features.size(); ++i) {
++            ct::record("vision.deepstack." + std::to_string(i), vision_output.deepstack_features[i]);
++        }
+         for (const auto &features : vision_output.deepstack_features) {
+             if (features->size(0) != vision_output.pooler_output->size(0)) {
+                 throw std::runtime_error(
+@@ -153,6 +164,7 @@ Qwen3VLModel::forward(const infinilm::InfinilmModel::Input &input) const {
+         }
+     }
+ 
++    ct::record("fusion.inputs_embeds", inputs_embeds);
+     return language_model_->forward_embeds(
+         inputs_embeds, input.position_ids.value(), deepstack_embeddings);
+ }
+@@ -177,8 +189,15 @@ Qwen3VLForConditionalGeneration::Qwen3VLForConditionalGeneration(
+ 
+ infinilm::InfinilmModel::Output Qwen3VLForConditionalGeneration::forward(
+     const infinilm::InfinilmModel::Input &input) const {
++    if (condition_encoder_mode_) {
++        ct::begin();
++        ct::record("input.ids", input.input_ids.value());
++        ct::record("input.positions", input.position_ids.value());
++    }
+     auto hidden_states = model_->forward(input);
+     if (condition_encoder_mode_) {
++        ct::record("condition.output", hidden_states);
++        ct::finish();
+         return {hidden_states};
+     }
+     return {lm_head_->forward(hidden_states), hidden_states};
+diff --git a/csrc/models/qwen3_vl/qwen3_vl_text_model.cpp b/csrc/models/qwen3_vl/qwen3_vl_text_model.cpp
+index 004163e..28db9ca 100644
+--- a/csrc/models/qwen3_vl/qwen3_vl_text_model.cpp
++++ b/csrc/models/qwen3_vl/qwen3_vl_text_model.cpp
+@@ -1,4 +1,5 @@
+ #include "qwen3_vl_text_model.hpp"
++#include "condition_trace.hpp"
+ 
+ #include "../../global_state/global_state.hpp"
+ 
+@@ -9,6 +10,7 @@
+ #include <string>
+ 
+ namespace infinilm::models::qwen3_vl {
++namespace ct = infinilm::models::condition_trace;
+ 
+ Qwen3VLTextModel::Qwen3VLTextModel(
+     std::shared_ptr<infinilm::config::ModelConfig> model_config,
+@@ -60,9 +62,15 @@ Qwen3VLTextModel::embed_tokens(const infinicore::Tensor &input_ids) const {
+ infinicore::Tensor Qwen3VLTextModel::run_layers(
+     infinicore::Tensor hidden_states, const infinicore::Tensor &position_ids,
+     const std::vector<Qwen3VLDeepStackEmbedding> &deepstack_embeddings) const {
++    ct::record("text.input", hidden_states);
+     infinicore::Tensor residual;
+     for (size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
++        ct::Scope layer_scope("text.layer." + std::to_string(layer_idx) + ".");
++        ct::record("input.hidden", hidden_states);
++        ct::record("input.residual", residual);
+         layers_[layer_idx]->forward(position_ids, hidden_states, residual);
++        ct::record("decoder.hidden", hidden_states);
++        ct::record("decoder.residual", residual);
+ 
+         bool materialized = false;
+         for (const auto &deepstack : deepstack_embeddings) {
+@@ -83,6 +91,8 @@ infinicore::Tensor Qwen3VLTextModel::run_layers(
+             infinicore::op::add_(destination, destination,
+                                  deepstack.features->unsqueeze(0));
+         }
++        ct::record("after_deepstack.hidden", hidden_states);
++        ct::record("after_deepstack.residual", residual);
+     }
+ 
+     if (skip_final_norm_) {
+diff --git a/examples/minimax_h3.py b/examples/minimax_h3.py
+index 00dc929..d2a63c8 100644
+--- a/examples/minimax_h3.py
++++ b/examples/minimax_h3.py
+@@ -1,752 +1,819 @@
+-#!/usr/bin/env python3
+-
+-from __future__ import annotations
+-
+-import argparse
+-import functools
+-import gc
+-import json
+-import re
+-import time
+-from collections import defaultdict
+-from contextlib import contextmanager
+-from dataclasses import dataclass
+-from pathlib import Path
+-from typing import Any, Iterator, Sequence
+-
+-import torch
+-from accelerate import dispatch_model, infer_auto_device_map, init_empty_weights
+-from accelerate.utils import set_module_tensor_to_device
+-from diffusers import MiniMaxH3Transformer3DModel, ModularPipeline
+-from diffusers.modular_pipelines.minimax_h3 import (
+-    MiniMaxH3AudioReference,
+-    MiniMaxH3ImageReference,
+-    MiniMaxH3VideoReference,
+-)
+-from diffusers.utils import load_image
+-from diffusers.utils.export_utils import encode_video
+-from infinilm.multimodal.minimax_h3 import (
+-    MiniMaxH3ConditionEncoder,
+-    MiniMaxH3DiffusersAdapter,
+-    MiniMaxH3TransformerRunner,
+-)
+-from safetensors.torch import load_file
+-from transformers import Qwen3VLForConditionalGeneration
+-
+-DTYPE = torch.bfloat16
+-FPS = 24
+-
+-
+-class TimingReport:
+-    """Collect comparable wall-clock timings for both model backends."""
+-
+-    DISPLAY_ORDER = (
+-        "model.pipeline_create",
+-        "model.condition_encoder_create_and_load",
+-        "model.transformer_create_and_load",
+-        "model.remaining_components_create_and_load",
+-        "input.files_and_references",
+-        "input.arguments",
+-        "compute.condition_encoder",
+-        "input.video_vae_encode",
+-        "input.audio_vae_encode",
+-        "compute.h3_transformer",
+-        "output.video_vae_decode",
+-        "output.audio_vae_decode",
+-        "generation.pipeline_total",
+-        "output.media_encode",
+-        "total.end_to_end",
+-    )
+-
+-    def __init__(self, cuda_devices: Sequence[int]) -> None:
+-        self.cuda_devices = tuple(dict.fromkeys(cuda_devices))
+-        self.values: dict[str, list[float]] = defaultdict(list)
+-
+-    def synchronize(self) -> None:
+-        if not torch.cuda.is_available():
+-            return
+-        for device in self.cuda_devices:
+-            torch.cuda.synchronize(device)
+-
+-    @contextmanager
+-    def measure(self, name: str, *, synchronize: bool = False) -> Iterator[None]:
+-        if synchronize:
+-            self.synchronize()
+-        started = time.perf_counter()
+-        try:
+-            yield
+-        finally:
+-            if synchronize:
+-                self.synchronize()
+-            self.values[name].append(time.perf_counter() - started)
+-
+-    def total(self, name: str) -> float:
+-        return sum(self.values.get(name, ()))
+-
+-    def record(self, name: str, seconds: float) -> None:
+-        self.values[name].append(seconds)
+-
+-    def print_report(self, pipeline_total: float) -> None:
+-        print("\n[timing] MiniMax-H3 profile")
+-        for name in self.DISPLAY_ORDER:
+-            samples = self.values.get(name, ())
+-            total = sum(samples)
+-            suffix = ""
+-            if len(samples) > 1:
+-                suffix = f" ({len(samples)} calls, {total / len(samples):.3f} s/call)"
+-            elif not samples:
+-                suffix = " (0 calls)"
+-            print(f"  {name:<38} {total:9.3f} s{suffix}")
+-
+-        measured_compute = sum(
+-            self.total(name)
+-            for name in (
+-                "compute.condition_encoder",
+-                "compute.h3_transformer",
+-                "input.video_vae_encode",
+-                "input.audio_vae_encode",
+-                "output.video_vae_decode",
+-                "output.audio_vae_decode",
+-            )
+-        )
+-        residual = max(0.0, pipeline_total - measured_compute)
+-        print(f"  {'pipeline.other_preprocess_scheduler':<38} {residual:9.3f} s")
+-
+-
+-class ComponentProfiler:
+-    """Time the component methods invoked by the Diffusers pipeline."""
+-
+-    def __init__(self, report: TimingReport) -> None:
+-        self.report = report
+-        self._originals: list[tuple[Any, str, Any]] = []
+-
+-    def wrap(self, owner: Any, method_name: str, timing_name: str) -> None:
+-        original = getattr(owner, method_name)
+-
+-        @functools.wraps(original)
+-        def timed(*args: Any, **kwargs: Any) -> Any:
+-            with self.report.measure(timing_name, synchronize=True):
+-                return original(*args, **kwargs)
+-
+-        self._originals.append((owner, method_name, original))
+-        setattr(owner, method_name, timed)
+-
+-    def close(self) -> None:
+-        while self._originals:
+-            owner, method_name, original = self._originals.pop()
+-            setattr(owner, method_name, original)
+-
+-
+-def install_component_profilers(
+-    report: TimingReport,
+-    *,
+-    text_encoder: Any,
+-    transformer: Any,
+-    vae: Any,
+-    audio_vae: Any,
+-) -> ComponentProfiler:
+-    profiler = ComponentProfiler(report)
+-    profiler.wrap(text_encoder.model, "forward", "compute.condition_encoder")
+-    profiler.wrap(transformer, "forward", "compute.h3_transformer")
+-    profiler.wrap(vae, "encode", "input.video_vae_encode")
+-    profiler.wrap(audio_vae, "encode", "input.audio_vae_encode")
+-    profiler.wrap(vae, "decode", "output.video_vae_decode")
+-    profiler.wrap(audio_vae, "decode", "output.audio_vae_decode")
+-    return profiler
+-
+-
+-def parse_gpu_list(value: str) -> list[int]:
+-    devices = [int(item.strip()) for item in value.split(",") if item.strip()]
+-    if not devices:
+-        raise ValueError("GPU list must contain at least one device")
+-    if len(set(devices)) != len(devices):
+-        raise ValueError("GPU list must not contain duplicate devices")
+-    return devices
+-
+-
+-def make_max_memory(devices: Sequence[int], fraction: float) -> dict[int, str]:
+-    return {
+-        device: f"{int(torch.cuda.get_device_properties(device).total_memory / 1024**3 * fraction)}GiB"
+-        for device in devices
+-    }
+-
+-
+-def resolve_legacy_device_groups(
+-    devices: Sequence[int],
+-    text_devices_arg: str | None,
+-    transformer_devices_arg: str | None,
+-) -> tuple[list[int], list[int]]:
+-    if (text_devices_arg is None) != (transformer_devices_arg is None):
+-        raise ValueError(
+-            "--legacy-text-gpus and --legacy-transformer-gpus must be supplied together"
+-        )
+-    if text_devices_arg is not None:
+-        text_devices = parse_gpu_list(text_devices_arg)
+-        transformer_devices = parse_gpu_list(transformer_devices_arg)
+-    else:
+-        if len(devices) < 2:
+-            raise ValueError("legacy mode requires at least two GPUs")
+-        split = len(devices) // 2
+-        text_devices = list(devices[:split])
+-        transformer_devices = list(devices[split:])
+-    overlap = set(text_devices) & set(transformer_devices)
+-    if overlap:
+-        raise ValueError(
+-            f"legacy text and transformer GPU groups overlap: {sorted(overlap)}"
+-        )
+-    return text_devices, transformer_devices
+-
+-
+-def _legacy_h3_config(config: dict[str, Any]) -> dict[str, Any]:
+-    return {
+-        "num_attention_heads": config["num_attention_heads"],
+-        "attention_head_dim": config["attention_head_dim"],
+-        "hidden_size": config["hidden_size"],
+-        "num_layers": config["num_layers"],
+-        "num_refiner_layers": config["token_refiner_num_layers"],
+-        "ffn_dim": config["ffn_hidden_size"],
+-        "in_channels": config["latents_dim"],
+-        "audio_in_channels": config["audio_latents_dim"],
+-        "patch_size": tuple(config["patch_size"]),
+-        "text_dim": config["text_dim"],
+-        "freq_dim": config["timestep_input_dim"],
+-        "time_embed_hidden_dim": config["time_embed_hidden_size"],
+-        "time_embed_dim": config["time_embed_dim"],
+-        "rope_freq_dim": config["rope_inv_freq_len"],
+-        "norm_eps": config["norm_eps"],
+-        "qk_norm_eps": config["qk_norm_eps"],
+-        "final_norm_eps": config["final_norm_eps"],
+-    }
+-
+-
+-def _remap_legacy_h3_tensor(
+-    name: str,
+-    tensor: torch.Tensor,
+-    *,
+-    num_heads: int,
+-    head_dim: int,
+-) -> dict[str, torch.Tensor]:
+-    if name == "rope.inv_freq":
+-        return {}
+-    name = re.sub(
+-        r"^token_refiner\.blocks\.(\d+)\.",
+-        r"token_refiner.refiner_blocks.\1.",
+-        name,
+-    )
+-    name = re.sub(r"^blocks\.(\d+)\.", r"transformer_blocks.\1.", name)
+-    for source, target in (
+-        ("video_patch_proj.", "proj_in."),
+-        ("audio_patch_proj.", "audio_proj_in."),
+-        ("condition_proj.", "context_embedder."),
+-        ("time_embedder.proj_in.", "time_embedder.linear_1."),
+-        ("time_embedder.proj_out.", "time_embedder.linear_2."),
+-        ("final_layer.norm.", "norm_out.norm."),
+-        ("final_layer.adaln_proj.linear.", "norm_out.linear."),
+-        ("final_layer.video_out.", "proj_out."),
+-        ("final_layer.audio_out.", "audio_proj_out."),
+-    ):
+-        if name.startswith(source):
+-            name = target + name[len(source) :]
+-            break
+-    name = name.replace(".attn.q_norm.", ".attn.norm_q.")
+-    name = name.replace(".attn.k_norm.", ".attn.norm_k.")
+-    name = name.replace(".attn.out_proj.", ".attn.to_out.0.")
+-    name = name.replace(".mlp.fc1.", ".ff.net.0.proj.")
+-    name = name.replace(".mlp.fc2.", ".ff.net.2.")
+-
+-    if not name.endswith(".attn.qkv_proj.weight"):
+-        return {name: tensor}
+-    packed = tensor.view(num_heads, 3, head_dim, tensor.shape[1])
+-    query, key, value = packed.unbind(dim=1)
+-    prefix = name[: -len("qkv_proj.weight")]
+-    shape = (num_heads * head_dim, tensor.shape[1])
+-    return {
+-        prefix + "to_q.weight": query.reshape(shape),
+-        prefix + "to_k.weight": key.reshape(shape),
+-        prefix + "to_v.weight": value.reshape(shape),
+-    }
+-
+-
+-def _parameter_device(name: str, device_map: dict[str, Any]) -> Any:
+-    module_name = name
+-    while module_name not in device_map:
+-        if "." not in module_name:
+-            module_name = ""
+-            break
+-        module_name = module_name.rsplit(".", 1)[0]
+-    if module_name not in device_map:
+-        raise KeyError(f"No device-map entry covers {name}")
+-    return device_map[module_name]
+-
+-
+-def load_legacy_h3_transformer(
+-    transformer_dir: Path,
+-    devices: Sequence[int],
+-    memory_fraction: float,
+-) -> MiniMaxH3Transformer3DModel:
+-    """Stream an original H3 checkpoint into the current Diffusers layout."""
+-
+-    with (transformer_dir / "config.json").open("r", encoding="utf-8") as handle:
+-        original_config = json.load(handle)
+-    model_config = _legacy_h3_config(original_config)
+-    with init_empty_weights():
+-        model = MiniMaxH3Transformer3DModel(**model_config)
+-
+-    device_map = infer_auto_device_map(
+-        model,
+-        max_memory=make_max_memory(devices, memory_fraction),
+-        no_split_module_classes=model._no_split_modules,
+-        dtype=DTYPE,
+-        clean_result=True,
+-    )
+-    expected = set(model.state_dict())
+-    fp32_prefixes = tuple(model._keep_in_fp32_modules)
+-    with (transformer_dir / "model.safetensors.index.json").open(
+-        "r", encoding="utf-8"
+-    ) as handle:
+-        weight_map = json.load(handle)["weight_map"]
+-
+-    for shard_name in dict.fromkeys(weight_map.values()):
+-        state_dict = load_file(transformer_dir / shard_name, device="cpu")
+-        for name, tensor in state_dict.items():
+-            remapped = _remap_legacy_h3_tensor(
+-                name,
+-                tensor,
+-                num_heads=model_config["num_attention_heads"],
+-                head_dim=model_config["attention_head_dim"],
+-            )
+-            for target_name, target_tensor in remapped.items():
+-                target_dtype = (
+-                    torch.float32 if target_name.startswith(fp32_prefixes) else DTYPE
+-                )
+-                set_module_tensor_to_device(
+-                    model,
+-                    target_name,
+-                    _parameter_device(target_name, device_map),
+-                    value=target_tensor,
+-                    dtype=target_dtype,
+-                )
+-                expected.remove(target_name)
+-        del state_dict
+-        gc.collect()
+-
+-    if expected:
+-        missing = ", ".join(sorted(expected)[:10])
+-        raise RuntimeError(f"Legacy H3 checkpoint is missing parameters: {missing}")
+-    return dispatch_model(model, device_map=device_map, force_hooks=True)
+-
+-
+-def module_execution_device(module: torch.nn.Module) -> torch.device:
+-    hook = getattr(module, "_hf_hook", None)
+-    execution_device = getattr(hook, "execution_device", None)
+-    if execution_device is not None:
+-        return torch.device(execution_device)
+-    return next(module.parameters()).device
+-
+-
+-def install_legacy_output_device_hooks(transformer: torch.nn.Module) -> None:
+-    """Keep projected outputs beside Diffusers' packed modality indices."""
+-
+-    index_device = module_execution_device(transformer.context_embedder)
+-
+-    def move_to_index_device(
+-        _module: torch.nn.Module,
+-        _inputs: tuple[torch.Tensor, ...],
+-        output: torch.Tensor,
+-    ) -> torch.Tensor:
+-        return output.to(index_device)
+-
+-    for name in ("proj_out", "audio_proj_out"):
+-        output_head = getattr(transformer, name)
+-        if module_execution_device(output_head) == index_device:
+-            continue
+-        output_head.register_forward_hook(move_to_index_device)
+-        print(f"[model] Routing legacy {name} output to {index_device}")
+-
+-
+-@dataclass(frozen=True)
+-class ModelPaths:
+-    modular_dir: Path
+-    partition_dir: Path
+-
+-
+-def _read_model_index(path: Path) -> dict[str, Any]:
+-    index_path = path / "model_index.json"
+-    if not index_path.is_file():
+-        raise FileNotFoundError(f"Missing model_index.json under {path}")
+-    with index_path.open("r", encoding="utf-8") as handle:
+-        return json.load(handle)
+-
+-
+-def resolve_model_paths(path: str, task: str) -> ModelPaths:
+-    candidate = Path(path).expanduser().resolve()
+-    if candidate.name == "diffusers":
+-        model_root = candidate.parent
+-        modular_dir = candidate
+-    elif candidate.name in ("FL2VA", "Ref2VA"):
+-        model_root = candidate.parent
+-        modular_dir = model_root / "diffusers"
+-    elif (candidate / "diffusers").is_dir():
+-        model_root = candidate
+-        modular_dir = candidate / "diffusers"
+-    else:
+-        model_root = candidate.parent
+-        modular_dir = candidate
+-
+-    modular_index = _read_model_index(modular_dir)
+-    if modular_index.get("_class_name") != "MiniMaxH3ModularPipeline":
+-        raise ValueError(f"Expected a MiniMaxH3 modular pipeline under {modular_dir}")
+-
+-    if task == "fl2va":
+-        partition_dir = modular_dir
+-    else:
+-        partition_dir = model_root / "Ref2VA"
+-        partition_index = _read_model_index(partition_dir)
+-        if partition_index.get("_minimax_h3", {}).get("partition") != "ref2va":
+-            raise ValueError(
+-                f"Expected a MiniMax-H3 Ref2VA checkpoint under {partition_dir}"
+-            )
+-
+-    for component in ("text_encoder", "transformer"):
+-        if not (partition_dir / component).is_dir():
+-            raise FileNotFoundError(f"Missing {task} component: {component}")
+-    return ModelPaths(modular_dir=modular_dir, partition_dir=partition_dir)
+-
+-
+-def load_pipeline(
+-    paths: ModelPaths,
+-    task: str,
+-    devices: list[int],
+-    timings: TimingReport,
+-    *,
+-    legacy: bool,
+-    legacy_text_devices: list[int],
+-    legacy_transformer_devices: list[int],
+-    legacy_memory_fraction: float,
+-) -> tuple[ModularPipeline, torch.nn.Module, torch.nn.Module]:
+-    transformer_component = "transformer" if task == "fl2va" else "transformer_ref"
+-    workflow = "t2va" if task == "fl2va" else "ref2va"
+-    print(f"[model] Loading modular components from: {paths.modular_dir}")
+-    print(f"[model] Loading {task} weights from:       {paths.partition_dir}")
+-    print(f"[model] Backend: {'legacy PyTorch' if legacy else 'InfiniLM'}")
+-    if legacy:
+-        print(f"[model] Qwen3-VL devices: {legacy_text_devices}")
+-        print(f"[model] H3 transformer devices: {legacy_transformer_devices}")
+-    else:
+-        print(f"[model] InfiniLM TP devices: {devices}")
+-
+-    with timings.measure("model.pipeline_create", synchronize=True):
+-        pipe = ModularPipeline.from_pretrained(
+-            str(paths.modular_dir), local_files_only=True
+-        )
+-
+-    if legacy:
+-        with timings.measure(
+-            "model.condition_encoder_create_and_load", synchronize=True
+-        ):
+-            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+-                str(paths.partition_dir),
+-                subfolder="text_encoder",
+-                dtype=DTYPE,
+-                device_map="balanced_low_0",
+-                max_memory=make_max_memory(legacy_text_devices, legacy_memory_fraction),
+-                low_cpu_mem_usage=True,
+-                local_files_only=True,
+-            )
+-        with timings.measure("model.transformer_create_and_load", synchronize=True):
+-            if task == "fl2va":
+-                transformer = MiniMaxH3Transformer3DModel.from_pretrained(
+-                    str(paths.partition_dir),
+-                    subfolder="transformer",
+-                    dtype=DTYPE,
+-                    device_map="balanced",
+-                    max_memory=make_max_memory(
+-                        legacy_transformer_devices, legacy_memory_fraction
+-                    ),
+-                    low_cpu_mem_usage=True,
+-                    local_files_only=True,
+-                )
+-            else:
+-                transformer = load_legacy_h3_transformer(
+-                    paths.partition_dir / "transformer",
+-                    legacy_transformer_devices,
+-                    legacy_memory_fraction,
+-                )
+-        install_legacy_output_device_hooks(transformer)
+-    else:
+-        with timings.measure(
+-            "model.condition_encoder_create_and_load", synchronize=True
+-        ):
+-            text_encoder = MiniMaxH3ConditionEncoder(
+-                paths.partition_dir / "text_encoder",
+-                dtype=DTYPE,
+-                tp_device_ids=devices,
+-            )
+-        with timings.measure("model.transformer_create_and_load", synchronize=True):
+-            runner = MiniMaxH3TransformerRunner(
+-                paths.partition_dir / "transformer",
+-                device="nvidia",
+-                tp_device_ids=devices,
+-            )
+-            transformer = MiniMaxH3DiffusersAdapter(runner, dtype=DTYPE)
+-
+-    text_encoder.requires_grad_(False)
+-    text_encoder.eval()
+-    transformer.requires_grad_(False)
+-    transformer.eval()
+-    pipe.update_components(
+-        text_encoder=text_encoder,
+-        **{transformer_component: transformer},
+-    )
+-
+-    with timings.measure(
+-        "model.remaining_components_create_and_load", synchronize=True
+-    ):
+-        pipe.load_components(
+-            workflow=workflow,
+-            dtype=DTYPE,
+-            pretrained_model_name_or_path=str(paths.modular_dir),
+-            local_files_only=True,
+-        )
+-        execution_device = pipe._execution_device
+-        print(f"[model] Diffusers execution device: {execution_device}")
+-        pipe.vae.to(device=execution_device, dtype=DTYPE)
+-        pipe.audio_vae.to(device=execution_device, dtype=DTYPE)
+-        pipe.vae.requires_grad_(False)
+-        pipe.audio_vae.requires_grad_(False)
+-    return pipe, text_encoder, transformer
+-
+-
+-def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+-    parser.add_argument("--model-path", required=True)
+-    parser.add_argument("--text", required=True)
+-    parser.add_argument("--gpus", default="0,1,2,3")
+-    parser.add_argument("--steps", type=int, default=50)
+-    parser.add_argument("--seed", type=int, default=42)
+-    parser.add_argument("--height", type=int)
+-    parser.add_argument("--width", type=int)
+-    parser.add_argument(
+-        "--legacy",
+-        action="store_true",
+-        help="Use the pure Transformers/Diffusers model implementation",
+-    )
+-    parser.add_argument(
+-        "--legacy-text-gpus",
+-        help="Legacy Qwen3-VL GPU list; defaults to the first half of --gpus",
+-    )
+-    parser.add_argument(
+-        "--legacy-transformer-gpus",
+-        help="Legacy H3 GPU list; defaults to the second half of --gpus",
+-    )
+-    parser.add_argument("--legacy-memory-fraction", type=float, default=0.82)
+-
+-
+-def parse_args() -> argparse.Namespace:
+-    parser = argparse.ArgumentParser(
+-        description="MiniMax-H3 FL2VA and Ref2VA generation"
+-    )
+-    subparsers = parser.add_subparsers(dest="task", required=True)
+-
+-    fl2va = subparsers.add_parser(
+-        "fl2va", help="Text and optional first/last-frame generation"
+-    )
+-    add_common_arguments(fl2va)
+-    fl2va.add_argument("--first-frame")
+-    fl2va.add_argument("--last-frame")
+-    fl2va.add_argument("--num-frames", type=int, default=124)
+-    fl2va.add_argument("--output", default="minimax_h3_fl2va_output.mp4")
+-
+-    ref2va = subparsers.add_parser(
+-        "ref2va", help="Reference image/video/audio conditioned generation"
+-    )
+-    add_common_arguments(ref2va)
+-    ref2va.add_argument("--reference-image")
+-    ref2va.add_argument("--reference-video")
+-    ref2va.add_argument("--audio")
+-    ref2va.add_argument("--num-frames", type=int)
+-    ref2va.add_argument("--output", default="minimax_h3_ref2va_output.mp4")
+-    return parser.parse_args()
+-
+-
+-def validate_args(args: argparse.Namespace) -> tuple[list[int], list[int], list[int]]:
+-    devices = parse_gpu_list(args.gpus)
+-    legacy_text_devices: list[int] = []
+-    legacy_transformer_devices: list[int] = []
+-    if args.legacy:
+-        legacy_text_devices, legacy_transformer_devices = resolve_legacy_device_groups(
+-            devices,
+-            args.legacy_text_gpus,
+-            args.legacy_transformer_gpus,
+-        )
+-    active_devices = (
+-        legacy_text_devices + legacy_transformer_devices if args.legacy else devices
+-    )
+-    if not torch.cuda.is_available():
+-        raise RuntimeError("CUDA is required")
+-    if max(active_devices) >= torch.cuda.device_count():
+-        raise ValueError(
+-            f"Requested GPU {max(active_devices)}, but only "
+-            f"{torch.cuda.device_count()} are visible"
+-        )
+-    if not 0.1 <= args.legacy_memory_fraction <= 0.95:
+-        raise ValueError("--legacy-memory-fraction must be in [0.1, 0.95]")
+-    if (args.height is None) != (args.width is None):
+-        raise ValueError("--height and --width must be supplied together")
+-    if args.height is not None and (args.height % 32 != 0 or args.width % 32 != 0):
+-        raise ValueError("--height and --width must be multiples of 32")
+-    if (
+-        args.task == "ref2va"
+-        and args.reference_image is None
+-        and args.reference_video is None
+-    ):
+-        raise ValueError("Ref2VA requires --reference-image or --reference-video")
+-    return devices, legacy_text_devices, legacy_transformer_devices
+-
+-
+-def prepare_generation_inputs(
+-    args: argparse.Namespace,
+-    timings: TimingReport,
+-) -> tuple[ModelPaths, dict[str, Any], dict[str, Any]]:
+-    with timings.measure("input.files_and_references"):
+-        paths = resolve_model_paths(args.model_path, args.task)
+-        if args.task == "fl2va":
+-            first_image = (
+-                load_image(args.first_frame).convert("RGB")
+-                if args.first_frame is not None
+-                else None
+-            )
+-            last_image = (
+-                load_image(args.last_frame).convert("RGB")
+-                if args.last_frame is not None
+-                else None
+-            )
+-            prepared = {
+-                "first_image": first_image,
+-                "last_image": last_image,
+-                "num_frames": args.num_frames,
+-            }
+-        else:
+-            references = []
+-            video_reference = None
+-            audio_reference = None
+-            if args.reference_image is not None:
+-                references.append(
+-                    MiniMaxH3ImageReference.from_file(args.reference_image)
+-                )
+-            if args.reference_video is not None:
+-                video_reference = MiniMaxH3VideoReference.from_file(
+-                    args.reference_video
+-                )
+-                references.append(video_reference)
+-            if args.audio is not None:
+-                audio_reference = MiniMaxH3AudioReference.from_file(args.audio)
+-                references.append(audio_reference)
+-
+-            num_frames = args.num_frames
+-            if num_frames is None and audio_reference is not None:
+-                num_frames = round(
+-                    audio_reference.audio.shape[-1] / audio_reference.sample_rate * FPS
+-                )
+-            elif num_frames is None and video_reference is not None:
+-                num_frames = round(
+-                    len(video_reference.frames) / video_reference.fps * FPS
+-                )
+-            prepared = {"references": references, "num_frames": num_frames}
+-
+-    with timings.measure("input.arguments"):
+-        generation_kwargs = {
+-            "prompt": args.text,
+-            "num_frames": prepared["num_frames"],
+-            "num_inference_steps": args.steps,
+-            "generator": torch.Generator("cpu").manual_seed(args.seed),
+-            "output": ["videos", "audio", "sampling_rate"],
+-        }
+-        if args.task == "fl2va":
+-            if prepared["first_image"] is not None:
+-                generation_kwargs["image"] = prepared["first_image"]
+-            if prepared["last_image"] is not None:
+-                generation_kwargs["last_image"] = prepared["last_image"]
+-        else:
+-            generation_kwargs["references"] = prepared["references"]
+-        if args.height is not None:
+-            generation_kwargs["height"] = args.height
+-            generation_kwargs["width"] = args.width
+-    return paths, generation_kwargs, prepared
+-
+-
+-def print_generation_summary(
+-    args: argparse.Namespace,
+-    prepared: dict[str, Any],
+-) -> None:
+-    print(f"[generate] Running MiniMax-H3 {args.task.upper()}")
+-    print(f"  text:            {args.text}")
+-    if args.task == "fl2va":
+-        print(f"  first frame:     {prepared['first_image'] is not None}")
+-        print(f"  last frame:      {prepared['last_image'] is not None}")
+-    else:
+-        if args.reference_image is not None:
+-            print(f"  reference image: {args.reference_image}")
+-        if args.reference_video is not None:
+-            print(f"  reference video: {args.reference_video}")
+-        if args.audio is not None:
+-            print(f"  reference audio: {args.audio}")
+-    print(f"  frames:          {prepared['num_frames']}")
+-    print(f"  steps:           {args.steps}")
+-    print(f"  backend:         {'legacy PyTorch' if args.legacy else 'InfiniLM'}")
+-
+-
+-def main() -> None:
+-    args = parse_args()
+-    total_started = time.perf_counter()
+-    devices, legacy_text_devices, legacy_transformer_devices = validate_args(args)
+-    active_devices = (
+-        legacy_text_devices + legacy_transformer_devices if args.legacy else devices
+-    )
+-    timings = TimingReport(active_devices)
+-    paths, generation_kwargs, prepared = prepare_generation_inputs(args, timings)
+-    pipe, text_encoder, transformer = load_pipeline(
+-        paths,
+-        args.task,
+-        devices,
+-        timings,
+-        legacy=args.legacy,
+-        legacy_text_devices=legacy_text_devices,
+-        legacy_transformer_devices=legacy_transformer_devices,
+-        legacy_memory_fraction=args.legacy_memory_fraction,
+-    )
+-
+-    print_generation_summary(args, prepared)
+-    profiler = install_component_profilers(
+-        timings,
+-        text_encoder=text_encoder,
+-        transformer=transformer,
+-        vae=pipe.vae,
+-        audio_vae=pipe.audio_vae,
+-    )
+-    try:
+-        with (
+-            torch.inference_mode(),
+-            timings.measure("generation.pipeline_total", synchronize=True),
+-        ):
+-            result = pipe(**generation_kwargs)
+-    finally:
+-        profiler.close()
+-
+-    with timings.measure("output.media_encode"):
+-        output_path = Path(args.output).expanduser().resolve()
+-        output_path.parent.mkdir(parents=True, exist_ok=True)
+-        encode_video(
+-            result["videos"][0],
+-            fps=FPS,
+-            output_path=str(output_path),
+-            audio=result["audio"][0],
+-            audio_sample_rate=result["sampling_rate"],
+-        )
+-    timings.synchronize()
+-    timings.record("total.end_to_end", time.perf_counter() - total_started)
+-    timings.print_report(timings.total("generation.pipeline_total"))
+-    print(f"[done] Saved to: {output_path}")
+-
+-
+-if __name__ == "__main__":
+-    main()
++#!/usr/bin/env python3
++
++from __future__ import annotations
++
++import argparse
++import functools
++import gc
++import json
++import re
++import time
++from collections import defaultdict
++from contextlib import contextmanager
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Iterator, Sequence
++
++import torch
++from accelerate import dispatch_model, infer_auto_device_map, init_empty_weights
++from accelerate.utils import set_module_tensor_to_device
++from diffusers import MiniMaxH3Transformer3DModel, ModularPipeline
++from diffusers.modular_pipelines.minimax_h3 import (
++    MiniMaxH3AudioReference,
++    MiniMaxH3ImageReference,
++    MiniMaxH3VideoReference,
++)
++from diffusers.utils import load_image
++from diffusers.utils.export_utils import encode_video
++from infinilm.multimodal.minimax_h3 import (
++    MiniMaxH3ConditionEncoder,
++    MiniMaxH3DiffusersAdapter,
++    MiniMaxH3TransformerRunner,
++)
++from safetensors.torch import load_file
++from transformers import Qwen3VLForConditionalGeneration
++
++DTYPE = torch.bfloat16
++
++FPS = 24
++
++
++class TimingReport:
++    """Collect comparable wall-clock timings for both model backends."""
++
++    DISPLAY_ORDER = (
++        "model.pipeline_create",
++        "model.condition_encoder_create_and_load",
++        "model.transformer_create_and_load",
++        "model.remaining_components_create_and_load",
++        "input.files_and_references",
++        "input.arguments",
++        "compute.condition_encoder",
++        "input.video_vae_encode",
++        "input.audio_vae_encode",
++        "compute.h3_transformer",
++        "output.video_vae_decode",
++        "output.audio_vae_decode",
++        "generation.pipeline_total",
++        "output.media_encode",
++        "total.end_to_end",
++    )
++
++    def __init__(self, cuda_devices: Sequence[int]) -> None:
++        self.cuda_devices = tuple(dict.fromkeys(cuda_devices))
++        self.values: dict[str, list[float]] = defaultdict(list)
++
++    def synchronize(self) -> None:
++        if not torch.cuda.is_available():
++            return
++        for device in self.cuda_devices:
++            torch.cuda.synchronize(device)
++
++    @contextmanager
++    def measure(self, name: str, *, synchronize: bool = False) -> Iterator[None]:
++        if synchronize:
++            self.synchronize()
++        started = time.perf_counter()
++        try:
++            yield
++        finally:
++            if synchronize:
++                self.synchronize()
++            self.values[name].append(time.perf_counter() - started)
++
++    def total(self, name: str) -> float:
++        return sum(self.values.get(name, ()))
++
++    def record(self, name: str, seconds: float) -> None:
++        self.values[name].append(seconds)
++
++    def print_report(self, pipeline_total: float) -> None:
++        print("\n[timing] MiniMax-H3 profile")
++        for name in self.DISPLAY_ORDER:
++            samples = self.values.get(name, ())
++            total = sum(samples)
++            suffix = ""
++            if len(samples) > 1:
++                suffix = f" ({len(samples)} calls, {total / len(samples):.3f} s/call)"
++            elif not samples:
++                suffix = " (0 calls)"
++            print(f"  {name:<38} {total:9.3f} s{suffix}")
++
++        measured_compute = sum(
++            self.total(name)
++            for name in (
++                "compute.condition_encoder",
++                "compute.h3_transformer",
++                "input.video_vae_encode",
++                "input.audio_vae_encode",
++                "output.video_vae_decode",
++                "output.audio_vae_decode",
++            )
++        )
++        residual = max(0.0, pipeline_total - measured_compute)
++        print(f"  {'pipeline.other_preprocess_scheduler':<38} {residual:9.3f} s")
++
++
++class ComponentProfiler:
++    """Time the component methods invoked by the Diffusers pipeline."""
++
++    def __init__(self, report: TimingReport) -> None:
++        self.report = report
++        self._originals: list[tuple[Any, str, Any]] = []
++
++    def wrap(self, owner: Any, method_name: str, timing_name: str) -> None:
++        original = getattr(owner, method_name)
++
++        @functools.wraps(original)
++        def timed(*args: Any, **kwargs: Any) -> Any:
++            with self.report.measure(timing_name, synchronize=True):
++                return original(*args, **kwargs)
++
++        self._originals.append((owner, method_name, original))
++        setattr(owner, method_name, timed)
++
++    def close(self) -> None:
++        while self._originals:
++            owner, method_name, original = self._originals.pop()
++            setattr(owner, method_name, original)
++
++
++def install_component_profilers(
++    report: TimingReport,
++    *,
++    text_encoder: Any,
++    transformer: Any,
++    vae: Any,
++    audio_vae: Any,
++) -> ComponentProfiler:
++    profiler = ComponentProfiler(report)
++    profiler.wrap(text_encoder.model, "forward", "compute.condition_encoder")
++    profiler.wrap(transformer, "forward", "compute.h3_transformer")
++    profiler.wrap(vae, "encode", "input.video_vae_encode")
++    profiler.wrap(audio_vae, "encode", "input.audio_vae_encode")
++    profiler.wrap(vae, "decode", "output.video_vae_decode")
++    profiler.wrap(audio_vae, "decode", "output.audio_vae_decode")
++    return profiler
++
++
++def parse_gpu_list(value: str) -> list[int]:
++    devices = [int(item.strip()) for item in value.split(",") if item.strip()]
++    if not devices:
++        raise ValueError("GPU list must contain at least one device")
++    if len(set(devices)) != len(devices):
++        raise ValueError("GPU list must not contain duplicate devices")
++    return devices
++
++
++def make_max_memory(devices: Sequence[int], fraction: float) -> dict[int, str]:
++    return {
++        device: f"{int(torch.cuda.get_device_properties(device).total_memory / 1024**3 * fraction)}GiB"
++        for device in devices
++    }
++
++
++def resolve_legacy_device_groups(
++    devices: Sequence[int],
++    text_devices_arg: str | None,
++    transformer_devices_arg: str | None,
++) -> tuple[list[int], list[int]]:
++    if (text_devices_arg is None) != (transformer_devices_arg is None):
++        raise ValueError(
++            "--legacy-text-gpus and --legacy-transformer-gpus must be supplied together"
++        )
++    if text_devices_arg is not None:
++        text_devices = parse_gpu_list(text_devices_arg)
++        transformer_devices = parse_gpu_list(transformer_devices_arg)
++    else:
++        if len(devices) < 2:
++            raise ValueError("legacy mode requires at least two GPUs")
++        split = len(devices) // 2
++        text_devices = list(devices[:split])
++        transformer_devices = list(devices[split:])
++    overlap = set(text_devices) & set(transformer_devices)
++    if overlap:
++        raise ValueError(
++            f"legacy text and transformer GPU groups overlap: {sorted(overlap)}"
++        )
++    return text_devices, transformer_devices
++
++
++def _legacy_h3_config(config: dict[str, Any]) -> dict[str, Any]:
++    return {
++        "num_attention_heads": config["num_attention_heads"],
++        "attention_head_dim": config["attention_head_dim"],
++        "hidden_size": config["hidden_size"],
++        "num_layers": config["num_layers"],
++        "num_refiner_layers": config["token_refiner_num_layers"],
++        "ffn_dim": config["ffn_hidden_size"],
++        "in_channels": config["latents_dim"],
++        "audio_in_channels": config["audio_latents_dim"],
++        "patch_size": tuple(config["patch_size"]),
++        "text_dim": config["text_dim"],
++        "freq_dim": config["timestep_input_dim"],
++        "time_embed_hidden_dim": config["time_embed_hidden_size"],
++        "time_embed_dim": config["time_embed_dim"],
++        "rope_freq_dim": config["rope_inv_freq_len"],
++        "norm_eps": config["norm_eps"],
++        "qk_norm_eps": config["qk_norm_eps"],
++        "final_norm_eps": config["final_norm_eps"],
++    }
++
++
++def _remap_legacy_h3_tensor(
++    name: str,
++    tensor: torch.Tensor,
++    *,
++    num_heads: int,
++    head_dim: int,
++) -> dict[str, torch.Tensor]:
++    if name == "rope.inv_freq":
++        return {}
++    name = re.sub(
++        r"^token_refiner\.blocks\.(\d+)\.",
++        r"token_refiner.refiner_blocks.\1.",
++        name,
++    )
++    name = re.sub(r"^blocks\.(\d+)\.", r"transformer_blocks.\1.", name)
++    for source, target in (
++        ("video_patch_proj.", "proj_in."),
++        ("audio_patch_proj.", "audio_proj_in."),
++        ("condition_proj.", "context_embedder."),
++        ("time_embedder.proj_in.", "time_embedder.linear_1."),
++        ("time_embedder.proj_out.", "time_embedder.linear_2."),
++        ("final_layer.norm.", "norm_out.norm."),
++        ("final_layer.adaln_proj.linear.", "norm_out.linear."),
++        ("final_layer.video_out.", "proj_out."),
++        ("final_layer.audio_out.", "audio_proj_out."),
++    ):
++        if name.startswith(source):
++            name = target + name[len(source) :]
++            break
++    name = name.replace(".attn.q_norm.", ".attn.norm_q.")
++    name = name.replace(".attn.k_norm.", ".attn.norm_k.")
++    name = name.replace(".attn.out_proj.", ".attn.to_out.0.")
++    name = name.replace(".mlp.fc1.", ".ff.net.0.proj.")
++    name = name.replace(".mlp.fc2.", ".ff.net.2.")
++
++    if not name.endswith(".attn.qkv_proj.weight"):
++        return {name: tensor}
++    packed = tensor.view(num_heads, 3, head_dim, tensor.shape[1])
++    query, key, value = packed.unbind(dim=1)
++    prefix = name[: -len("qkv_proj.weight")]
++    shape = (num_heads * head_dim, tensor.shape[1])
++    return {
++        prefix + "to_q.weight": query.reshape(shape),
++        prefix + "to_k.weight": key.reshape(shape),
++        prefix + "to_v.weight": value.reshape(shape),
++    }
++
++
++def _parameter_device(name: str, device_map: dict[str, Any]) -> Any:
++    module_name = name
++    while module_name not in device_map:
++        if "." not in module_name:
++            module_name = ""
++            break
++        module_name = module_name.rsplit(".", 1)[0]
++    if module_name not in device_map:
++        raise KeyError(f"No device-map entry covers {name}")
++    return device_map[module_name]
++
++
++def load_legacy_h3_transformer(
++    transformer_dir: Path,
++    devices: Sequence[int],
++    memory_fraction: float,
++) -> MiniMaxH3Transformer3DModel:
++    """Stream an original H3 checkpoint into the current Diffusers layout."""
++
++    with (transformer_dir / "config.json").open("r", encoding="utf-8") as handle:
++        original_config = json.load(handle)
++    model_config = _legacy_h3_config(original_config)
++    with init_empty_weights():
++        model = MiniMaxH3Transformer3DModel(**model_config)
++
++    device_map = infer_auto_device_map(
++        model,
++        max_memory=make_max_memory(devices, memory_fraction),
++        no_split_module_classes=model._no_split_modules,
++        dtype=DTYPE,
++        clean_result=True,
++    )
++    expected = set(model.state_dict())
++    fp32_prefixes = tuple(model._keep_in_fp32_modules)
++    with (transformer_dir / "model.safetensors.index.json").open(
++        "r", encoding="utf-8"
++    ) as handle:
++        weight_map = json.load(handle)["weight_map"]
++
++    for shard_name in dict.fromkeys(weight_map.values()):
++        state_dict = load_file(transformer_dir / shard_name, device="cpu")
++        for name, tensor in state_dict.items():
++            remapped = _remap_legacy_h3_tensor(
++                name,
++                tensor,
++                num_heads=model_config["num_attention_heads"],
++                head_dim=model_config["attention_head_dim"],
++            )
++            for target_name, target_tensor in remapped.items():
++                target_dtype = (
++                    torch.float32 if target_name.startswith(fp32_prefixes) else DTYPE
++                )
++                set_module_tensor_to_device(
++                    model,
++                    target_name,
++                    _parameter_device(target_name, device_map),
++                    value=target_tensor,
++                    dtype=target_dtype,
++                )
++                expected.remove(target_name)
++        del state_dict
++        gc.collect()
++
++    if expected:
++        missing = ", ".join(sorted(expected)[:10])
++        raise RuntimeError(f"Legacy H3 checkpoint is missing parameters: {missing}")
++    return dispatch_model(model, device_map=device_map, force_hooks=True)
++
++
++def module_execution_device(module: torch.nn.Module) -> torch.device:
++    hook = getattr(module, "_hf_hook", None)
++    execution_device = getattr(hook, "execution_device", None)
++    if execution_device is not None:
++        return torch.device(execution_device)
++    return next(module.parameters()).device
++
++
++def install_legacy_output_device_hooks(transformer: torch.nn.Module) -> None:
++    """Keep projected outputs beside Diffusers' packed modality indices."""
++
++    index_device = module_execution_device(transformer.context_embedder)
++
++    def move_to_index_device(
++        _module: torch.nn.Module,
++        _inputs: tuple[torch.Tensor, ...],
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        return output.to(index_device)
++
++    for name in ("proj_out", "audio_proj_out"):
++        output_head = getattr(transformer, name)
++        if module_execution_device(output_head) == index_device:
++            continue
++        output_head.register_forward_hook(move_to_index_device)
++        print(f"[model] Routing legacy {name} output to {index_device}")
++
++
++@dataclass(frozen=True)
++class ModelPaths:
++    modular_dir: Path
++    partition_dir: Path
++
++
++def _read_model_index(path: Path) -> dict[str, Any]:
++    index_path = path / "model_index.json"
++    if not index_path.is_file():
++        raise FileNotFoundError(f"Missing model_index.json under {path}")
++    with index_path.open("r", encoding="utf-8") as handle:
++        return json.load(handle)
++
++
++def resolve_model_paths(path: str, task: str) -> ModelPaths:
++    candidate = Path(path).expanduser().resolve()
++    if candidate.name == "diffusers":
++        model_root = candidate.parent
++        modular_dir = candidate
++    elif candidate.name in ("FL2VA", "Ref2VA"):
++        model_root = candidate.parent
++        modular_dir = model_root / "diffusers"
++    elif (candidate / "diffusers").is_dir():
++        model_root = candidate
++        modular_dir = candidate / "diffusers"
++    else:
++        model_root = candidate.parent
++        modular_dir = candidate
++
++    modular_index = _read_model_index(modular_dir)
++    if modular_index.get("_class_name") != "MiniMaxH3ModularPipeline":
++        raise ValueError(f"Expected a MiniMaxH3 modular pipeline under {modular_dir}")
++
++    if task == "fl2va":
++        partition_dir = modular_dir
++    else:
++        partition_dir = model_root / "Ref2VA"
++        partition_index = _read_model_index(partition_dir)
++        if partition_index.get("_minimax_h3", {}).get("partition") != "ref2va":
++            raise ValueError(
++                f"Expected a MiniMax-H3 Ref2VA checkpoint under {partition_dir}"
++            )
++
++    for component in ("text_encoder", "transformer"):
++        if not (partition_dir / component).is_dir():
++            raise FileNotFoundError(f"Missing {task} component: {component}")
++    return ModelPaths(modular_dir=modular_dir, partition_dir=partition_dir)
++
++
++def load_pipeline(
++    paths: ModelPaths,
++    task: str,
++    devices: list[int],
++    timings: TimingReport,
++    *,
++    legacy: bool,
++    legacy_text_devices: list[int],
++    legacy_transformer_devices: list[int],
++    legacy_memory_fraction: float,
++) -> tuple[ModularPipeline, torch.nn.Module, torch.nn.Module]:
++    # The same convolution controls feed MIOpen on ROCm. Keep VAE
++    # conditioning repeatable; disabling benchmarking alone is insufficient.
++    torch.backends.cudnn.benchmark = False
++    torch.backends.cudnn.deterministic = True
++    transformer_component = "transformer" if task == "fl2va" else "transformer_ref"
++    workflow = "t2va" if task == "fl2va" else "ref2va"
++    print(f"[model] Loading modular components from: {paths.modular_dir}")
++    print(f"[model] Loading {task} weights from:       {paths.partition_dir}")
++    print(f"[model] Backend: {'legacy PyTorch' if legacy else 'InfiniLM'}")
++    if legacy:
++        print(f"[model] Qwen3-VL devices: {legacy_text_devices}")
++        print(f"[model] H3 transformer devices: {legacy_transformer_devices}")
++    else:
++        print(f"[model] InfiniLM TP devices: {devices}")
++
++    with timings.measure("model.pipeline_create", synchronize=True):
++        pipe = ModularPipeline.from_pretrained(
++            str(paths.modular_dir), local_files_only=True
++        )
++
++    if legacy:
++        with timings.measure(
++            "model.condition_encoder_create_and_load", synchronize=True
++        ):
++            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
++                str(paths.partition_dir),
++                subfolder="text_encoder",
++                dtype=DTYPE,
++                attn_implementation="eager",
++                device_map="balanced_low_0",
++                max_memory=make_max_memory(legacy_text_devices, legacy_memory_fraction),
++                low_cpu_mem_usage=True,
++                local_files_only=True,
++            )
++        with timings.measure("model.transformer_create_and_load", synchronize=True):
++            if task == "fl2va":
++                transformer = MiniMaxH3Transformer3DModel.from_pretrained(
++                    str(paths.partition_dir),
++                    subfolder="transformer",
++                    dtype=DTYPE,
++                    device_map="balanced",
++                    max_memory=make_max_memory(
++                        legacy_transformer_devices, legacy_memory_fraction
++                    ),
++                    low_cpu_mem_usage=True,
++                    local_files_only=True,
++                )
++            else:
++                transformer = load_legacy_h3_transformer(
++                    paths.partition_dir / "transformer",
++                    legacy_transformer_devices,
++                    legacy_memory_fraction,
++                )
++        install_legacy_output_device_hooks(transformer)
++    else:
++        with timings.measure(
++            "model.condition_encoder_create_and_load", synchronize=True
++        ):
++            text_encoder = MiniMaxH3ConditionEncoder(
++                paths.partition_dir / "text_encoder",
++                dtype=DTYPE,
++                tp_device_ids=devices,
++            )
++        with timings.measure("model.transformer_create_and_load", synchronize=True):
++            runner = MiniMaxH3TransformerRunner(
++                paths.partition_dir / "transformer",
++                device="nvidia",
++                tp_device_ids=devices,
++            )
++            transformer = MiniMaxH3DiffusersAdapter(runner, dtype=DTYPE)
++
++    text_encoder.requires_grad_(False)
++    text_encoder.eval()
++    transformer.requires_grad_(False)
++    transformer.eval()
++    pipe.update_components(
++        text_encoder=text_encoder,
++        **{transformer_component: transformer},
++    )
++
++    with timings.measure(
++        "model.remaining_components_create_and_load", synchronize=True
++    ):
++        pipe.load_components(
++            workflow=workflow,
++            dtype=DTYPE,
++            pretrained_model_name_or_path=str(paths.modular_dir),
++            local_files_only=True,
++        )
++        # The Qwen3-VL video processor requires torchvision, which the DCU
++        # images do not ship. `Qwen3VLProcessor.from_pretrained` therefore fails
++        # and `load_components` silently leaves `processor` as None. A still
++        # frame FL2VA run only needs the image processor and the tokenizer, so
++        # build the processor without the video branch.
++        if getattr(pipe, "processor", None) is None:
++            from transformers import (
++                AutoImageProcessor,
++                AutoTokenizer,
++                Qwen3VLProcessor,
++            )
++
++            processor_dir = paths.modular_dir / "processor"
++            image_processor = AutoImageProcessor.from_pretrained(
++                str(processor_dir), local_files_only=True
++            )
++            tokenizer_for_processor = AutoTokenizer.from_pretrained(
++                str(processor_dir), local_files_only=True
++            )
++            try:
++                processor = Qwen3VLProcessor(
++                    image_processor=image_processor,
++                    tokenizer=tokenizer_for_processor,
++                )
++                print("[model] processor built (standard construction)")
++            except Exception as exc:  # noqa: BLE001
++                # transformers 5.x validates every attribute against a lazily
++                # initialised mapping that never loads without torchvision, so
++                # instantiate without the validation and set what the H3 blocks
++                # actually read.
++                print(
++                    f"[model] standard processor construction failed "
++                    f"({type(exc).__name__}: {exc}); falling back"
++                )
++                processor = object.__new__(Qwen3VLProcessor)
++                processor.image_processor = image_processor
++                processor.tokenizer = tokenizer_for_processor
++                processor.video_processor = None
++                processor.chat_template = None
++                for attribute, token in (
++                    ("image_token_id", "<|image_pad|>"),
++                    ("video_token_id", "<|video_pad|>"),
++                    ("audio_token_id", None),
++                ):
++                    setattr(
++                        processor,
++                        attribute,
++                        tokenizer_for_processor.convert_tokens_to_ids(token)
++                        if token
++                        else None,
++                    )
++                print(
++                    "[model] processor built without torchvision: "
++                    f"{type(image_processor).__name__} + "
++                    f"{type(tokenizer_for_processor).__name__}, "
++                    f"image_token_id={processor.image_token_id}"
++                )
++            pipe.update_components(processor=processor)
++
++        execution_device = pipe._execution_device
++        print(f"[model] Diffusers execution device: {execution_device}")
++        # Keep the mixed precision selected by from_pretrained, including
++        # each VAE's _keep_in_fp32_modules. Only move devices here.
++        pipe.vae.to(device=execution_device)
++        pipe.audio_vae.to(device=execution_device)
++        pipe.vae.requires_grad_(False)
++        pipe.audio_vae.requires_grad_(False)
++    return pipe, text_encoder, transformer
++
++
++def add_common_arguments(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument("--model-path", required=True)
++    parser.add_argument("--text", required=True)
++    parser.add_argument("--gpus", default="0,1,2,3")
++    parser.add_argument("--steps", type=int, default=50)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--height", type=int)
++    parser.add_argument("--width", type=int)
++    parser.add_argument(
++        "--legacy",
++        action="store_true",
++        help="Use the pure Transformers/Diffusers model implementation",
++    )
++    parser.add_argument(
++        "--legacy-text-gpus",
++        help="Legacy Qwen3-VL GPU list; defaults to the first half of --gpus",
++    )
++    parser.add_argument(
++        "--legacy-transformer-gpus",
++        help="Legacy H3 GPU list; defaults to the second half of --gpus",
++    )
++    parser.add_argument("--legacy-memory-fraction", type=float, default=0.82)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="MiniMax-H3 FL2VA and Ref2VA generation"
++    )
++    subparsers = parser.add_subparsers(dest="task", required=True)
++
++    fl2va = subparsers.add_parser(
++        "fl2va", help="Text and optional first/last-frame generation"
++    )
++    add_common_arguments(fl2va)
++    fl2va.add_argument("--first-frame")
++    fl2va.add_argument("--last-frame")
++    fl2va.add_argument("--num-frames", type=int, default=124)
++    fl2va.add_argument("--output", default="minimax_h3_fl2va_output.mp4")
++
++    ref2va = subparsers.add_parser(
++        "ref2va", help="Reference image/video/audio conditioned generation"
++    )
++    add_common_arguments(ref2va)
++    ref2va.add_argument("--reference-image")
++    ref2va.add_argument("--reference-video")
++    ref2va.add_argument("--audio")
++    ref2va.add_argument("--num-frames", type=int)
++    ref2va.add_argument("--output", default="minimax_h3_ref2va_output.mp4")
++    return parser.parse_args()
++
++
++def validate_args(args: argparse.Namespace) -> tuple[list[int], list[int], list[int]]:
++    devices = parse_gpu_list(args.gpus)
++    legacy_text_devices: list[int] = []
++    legacy_transformer_devices: list[int] = []
++    if args.legacy:
++        legacy_text_devices, legacy_transformer_devices = resolve_legacy_device_groups(
++            devices,
++            args.legacy_text_gpus,
++            args.legacy_transformer_gpus,
++        )
++    active_devices = (
++        legacy_text_devices + legacy_transformer_devices if args.legacy else devices
++    )
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA is required")
++    if max(active_devices) >= torch.cuda.device_count():
++        raise ValueError(
++            f"Requested GPU {max(active_devices)}, but only "
++            f"{torch.cuda.device_count()} are visible"
++        )
++    if not 0.1 <= args.legacy_memory_fraction <= 0.95:
++        raise ValueError("--legacy-memory-fraction must be in [0.1, 0.95]")
++    if (args.height is None) != (args.width is None):
++        raise ValueError("--height and --width must be supplied together")
++    if args.height is not None and (args.height % 32 != 0 or args.width % 32 != 0):
++        raise ValueError("--height and --width must be multiples of 32")
++    if (
++        args.task == "ref2va"
++        and args.reference_image is None
++        and args.reference_video is None
++    ):
++        raise ValueError("Ref2VA requires --reference-image or --reference-video")
++    return devices, legacy_text_devices, legacy_transformer_devices
++
++
++def prepare_generation_inputs(
++    args: argparse.Namespace,
++    timings: TimingReport,
++) -> tuple[ModelPaths, dict[str, Any], dict[str, Any]]:
++    with timings.measure("input.files_and_references"):
++        paths = resolve_model_paths(args.model_path, args.task)
++        if args.task == "fl2va":
++            first_image = (
++                load_image(args.first_frame).convert("RGB")
++                if args.first_frame is not None
++                else None
++            )
++            last_image = (
++                load_image(args.last_frame).convert("RGB")
++                if args.last_frame is not None
++                else None
++            )
++            prepared = {
++                "first_image": first_image,
++                "last_image": last_image,
++                "num_frames": args.num_frames,
++            }
++        else:
++            references = []
++            video_reference = None
++            audio_reference = None
++            if args.reference_image is not None:
++                references.append(
++                    MiniMaxH3ImageReference.from_file(args.reference_image)
++                )
++            if args.reference_video is not None:
++                video_reference = MiniMaxH3VideoReference.from_file(
++                    args.reference_video
++                )
++                references.append(video_reference)
++            if args.audio is not None:
++                audio_reference = MiniMaxH3AudioReference.from_file(args.audio)
++                references.append(audio_reference)
++
++            num_frames = args.num_frames
++            if num_frames is None and audio_reference is not None:
++                num_frames = round(
++                    audio_reference.audio.shape[-1] / audio_reference.sample_rate * FPS
++                )
++            elif num_frames is None and video_reference is not None:
++                num_frames = round(
++                    len(video_reference.frames) / video_reference.fps * FPS
++                )
++            prepared = {"references": references, "num_frames": num_frames}
++
++    with timings.measure("input.arguments"):
++        generation_kwargs = {
++            "prompt": args.text,
++            "num_frames": prepared["num_frames"],
++            "num_inference_steps": args.steps,
++            "generator": torch.Generator("cpu").manual_seed(args.seed),
++            "output": ["videos", "audio", "sampling_rate"],
++        }
++        if args.task == "fl2va":
++            if prepared["first_image"] is not None:
++                generation_kwargs["image"] = prepared["first_image"]
++            if prepared["last_image"] is not None:
++                generation_kwargs["last_image"] = prepared["last_image"]
++        else:
++            generation_kwargs["references"] = prepared["references"]
++        if args.height is not None:
++            generation_kwargs["height"] = args.height
++            generation_kwargs["width"] = args.width
++    return paths, generation_kwargs, prepared
++
++
++def print_generation_summary(
++    args: argparse.Namespace,
++    prepared: dict[str, Any],
++) -> None:
++    print(f"[generate] Running MiniMax-H3 {args.task.upper()}")
++    print(f"  text:            {args.text}")
++    if args.task == "fl2va":
++        print(f"  first frame:     {prepared['first_image'] is not None}")
++        print(f"  last frame:      {prepared['last_image'] is not None}")
++    else:
++        if args.reference_image is not None:
++            print(f"  reference image: {args.reference_image}")
++        if args.reference_video is not None:
++            print(f"  reference video: {args.reference_video}")
++        if args.audio is not None:
++            print(f"  reference audio: {args.audio}")
++    print(f"  frames:          {prepared['num_frames']}")
++    print(f"  steps:           {args.steps}")
++    print(f"  backend:         {'legacy PyTorch' if args.legacy else 'InfiniLM'}")
++
++
++def main() -> None:
++    args = parse_args()
++    total_started = time.perf_counter()
++    devices, legacy_text_devices, legacy_transformer_devices = validate_args(args)
++    active_devices = (
++        legacy_text_devices + legacy_transformer_devices if args.legacy else devices
++    )
++    timings = TimingReport(active_devices)
++    paths, generation_kwargs, prepared = prepare_generation_inputs(args, timings)
++    pipe, text_encoder, transformer = load_pipeline(
++        paths,
++        args.task,
++        devices,
++        timings,
++        legacy=args.legacy,
++        legacy_text_devices=legacy_text_devices,
++        legacy_transformer_devices=legacy_transformer_devices,
++        legacy_memory_fraction=args.legacy_memory_fraction,
++    )
++
++    print_generation_summary(args, prepared)
++    profiler = install_component_profilers(
++        timings,
++        text_encoder=text_encoder,
++        transformer=transformer,
++        vae=pipe.vae,
++        audio_vae=pipe.audio_vae,
++    )
++    try:
++        with (
++            torch.inference_mode(),
++            timings.measure("generation.pipeline_total", synchronize=True),
++        ):
++            result = pipe(**generation_kwargs)
++    finally:
++        profiler.close()
++
++    with timings.measure("output.media_encode"):
++        output_path = Path(args.output).expanduser().resolve()
++        output_path.parent.mkdir(parents=True, exist_ok=True)
++        encode_video(
++            result["videos"][0],
++            fps=FPS,
++            output_path=str(output_path),
++            audio=result["audio"][0],
++            audio_sample_rate=result["sampling_rate"],
++        )
++    timings.synchronize()
++    timings.record("total.end_to_end", time.perf_counter() - total_started)
++    timings.print_report(timings.total("generation.pipeline_total"))
++    print(f"[done] Saved to: {output_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/infinilm/multimodal/minimax_h3.py b/python/infinilm/multimodal/minimax_h3.py
+index ed4180d..07607e2 100644
+--- a/python/infinilm/multimodal/minimax_h3.py
++++ b/python/infinilm/multimodal/minimax_h3.py
+@@ -393,9 +393,17 @@ class MiniMaxH3ConditionEncoder(Qwen3VLForConditionalGeneration):
+ 
+     def encode(self, model_inputs: Mapping[str, Any]) -> torch.Tensor:
+         native_inputs = self._prepare_native_inputs(model_inputs)
++        # from_torch borrows storage; it does not order PyTorch producers before
++        # the InfiniCore stream. Include the contiguous copies made above.
++        torch.cuda.synchronize(self.torch_device)
+         input_ids = native_inputs.pop("input_ids")
+         output = self.engine.forward_raw(input_ids, **native_inputs)
+-        return MiniMaxH3TransformerRunner._to_torch(output["logits"], self.torch_device)
++        result = MiniMaxH3TransformerRunner._to_torch(output["logits"], self.torch_device)
++        # Workers signal host completion after enqueueing GPU work. Keep every
++        # borrowed input alive until all ranks have finished reading it.
++        for device_id in self.engine.distributed_config.tp_device_ids:
++            torch.cuda.synchronize(device_id)
++        return result
+ 
+     def forward(self, **model_inputs: Any) -> BaseModelOutputWithPast:
+         return self.model(**model_inputs)
+@@ -460,8 +468,12 @@ class MiniMaxH3TransformerRunner:
+             dtype=infinicore.utils.to_torch_dtype(tensor.dtype),
+             device=device,
+         )
++        # The caching allocator may recycle a block still used on a PyTorch
++        # stream. Finish those uses (and the native producer) before an external
++        # stream writes it. Then finish the copy before returning to PyTorch.
++        torch.cuda.synchronize(device)
+         infinicore.from_torch(output).copy_(tensor)
+-        infinicore.sync_device()
++        torch.cuda.synchronize(device)
+         return output
+ 
+     def __call__(
+@@ -488,6 +500,10 @@ class MiniMaxH3TransformerRunner:
+         native_inputs = {
+             name: self._to_infinicore(tensor) for name, tensor in torch_inputs.items()
+         }
++        # Synchronize after wrapping, since contiguous() itself may enqueue a
++        # PyTorch copy. Device-wide waits also cover non-default producer streams.
++        for device in {tensor.device for tensor in torch_inputs.values() if tensor.is_cuda}:
++            torch.cuda.synchronize(device)
+         output = self.engine.forward_raw(None, **native_inputs)
+         video = output["logits"]
+         audio = output["hidden_states"]
+@@ -495,6 +511,10 @@ class MiniMaxH3TransformerRunner:
+             torch_device = inputs.video_hidden_states.device
+             video = self._to_torch(video, torch_device)
+             audio = self._to_torch(audio, torch_device)
++        # Also cover return_torch=False: neither the engine's host completion
++        # nor a rank-0 copy guarantees every peer has released borrowed inputs.
++        for device_id in self.engine.distributed_config.tp_device_ids:
++            torch.cuda.synchronize(device_id)
+         return MiniMaxH3TransformerOutput(sample=video, audio_sample=audio)
+ 
+ 
+diff --git a/test/models/minimax_h3/test_adaln_rounding.py b/test/models/minimax_h3/test_adaln_rounding.py
+new file mode 100644
+index 0000000..ba96417
+--- /dev/null
++++ b/test/models/minimax_h3/test_adaln_rounding.py
+@@ -0,0 +1,132 @@
++"""Compile the actual AdaLN helper against CPU BF16 primitive stand-ins.
++
++The native backend is not available locally. This checks the C++ composition,
++rounding boundaries and scalar broadcasting, not the GPU primitives themselves.
++--baseline reads immutable src2 code and is expected to report mismatches.
++"""
++import pathlib
++import subprocess
++import sys
++import tarfile
++import tempfile
++
++PROJECT = pathlib.Path(__file__).resolve().parents[5]
++REL = 'InfiniLM/csrc/models/minimax_h3/minimax_h3_transformer.cpp'
++if '--baseline' in sys.argv:
++    with tarfile.open(PROJECT / '03_上传包/src2.tar.gz') as archive:
++        source = archive.extractfile('src/' + REL).read().decode()
++else:
++    source = (PROJECT / '02_源码' / REL).read_text()
++start = source.index('infinicore::Tensor apply_adaln(')
++brace = source.index('{', start)
++depth, end = 1, brace + 1
++while depth:
++    depth += (source[end] == '{') - (source[end] == '}')
++    end += 1
++helper = source[start:end]
++
++harness = r'''
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <random>
++#include <vector>
++#include <stdexcept>
++namespace infinicore {
++using Strides = std::vector<ptrdiff_t>;
++enum class DataType { BF16, F32 };
++struct Device {};
++float round_bf16(float x) {
++    uint32_t b; std::memcpy(&b, &x, sizeof b);
++    b += 0x7fff + ((b >> 16) & 1); b &= 0xffff0000u;
++    std::memcpy(&x, &b, sizeof x); return x;
++}
++float quantize(float x, DataType dtype) {
++    return dtype == DataType::BF16 ? round_bf16(x) : x;
++}
++struct Tensor {
++    std::vector<float> data;
++    DataType type;
++    std::vector<size_t> dimensions;
++    Tensor(std::vector<float> x, DataType t, std::vector<size_t> s)
++        : data(std::move(x)), type(t), dimensions(std::move(s)) {
++        for (auto &v : data) v = quantize(v, type);
++    }
++    const Tensor *operator->() const { return this; }
++    const std::vector<size_t> &shape() const { return dimensions; }
++    Tensor as_strided(std::vector<size_t> new_shape, Strides strides) const {
++        if (data.size() != 1 || strides.size() != new_shape.size())
++            throw std::runtime_error("invalid scalar view");
++        for (auto stride : strides) if (stride != 0) throw std::runtime_error("nonzero scalar stride");
++        return Tensor(data, type, new_shape);
++    }
++    DataType dtype() const { return type; }
++    Device device() const { return {}; }
++    static Tensor ones(std::vector<size_t> shape, DataType dtype, Device) {
++        size_t n = 1; for (auto dim : shape) n *= dim;
++        return Tensor(std::vector<float>(n, 1.f), dtype, shape);
++    }
++};
++namespace op {
++Tensor elementwise(const Tensor &a, const Tensor &b, bool multiply) {
++    if (a.shape() != b.shape())
++        throw std::runtime_error("invalid broadcast");
++    auto result = a;
++    for (size_t i = 0; i < a.data.size(); ++i) {
++        const float rhs = b.data[b.data.size() == 1 ? 0 : i];
++        result.data[i] = quantize(multiply ? a.data[i] * rhs : a.data[i] + rhs, a.type);
++    }
++    return result;
++}
++Tensor add(const Tensor &a, const Tensor &b) { return elementwise(a, b, false); }
++Tensor mul(const Tensor &a, const Tensor &b) { return elementwise(a, b, true); }
++}
++}
++'''
++harness += helper + r'''
++int main() {
++    using namespace infinicore;
++    std::mt19937 random(42);
++    std::uniform_real_distribution<float> draw(-4.f, 4.f);
++    size_t checked = 0, mismatches = 0;
++    for (auto dtype : {DataType::BF16, DataType::F32}) {
++        size_t before = mismatches;
++        for (int sample = 0; sample < 2001; ++sample) {
++            std::vector<float> n(6), s(6), t(6);
++            for (int i = 0; i < 6; ++i) {
++                n[i] = draw(random); s[i] = draw(random); t[i] = draw(random);
++            }
++            if (sample == 0) {
++                n = {.75f, 1.f, 2.f, -3.f, .125f, 4.f};
++                s = {1.f / 256, -1.f, -1.f + 1.f / 256, -1.f - 1.f / 128, 0.f, 1.f};
++                t = {0.f, 2.f, 0.f, .25f, -1.f, 0.f};
++            }
++            Tensor norm(n, dtype, {1,2,3}), scale(s, dtype, {1,2,3}), shift(t, dtype, {1,2,3});
++            auto actual = apply_adaln(norm, scale, shift);
++            if (actual.shape() != norm.shape() || actual.dtype() != dtype) return 2;
++            for (int i = 0; i < 6; ++i) {
++                float scale_plus_one = quantize(1.f + scale.data[i], dtype);
++                float modulated = quantize(norm.data[i] * scale_plus_one, dtype);
++                float expected = quantize(modulated + shift.data[i], dtype);
++                ++checked;
++                if (actual.data[i] != expected) {
++                    if (mismatches++ == 0)
++                        std::cout << "first mismatch: actual=" << actual.data[i]
++                                  << " reference=" << expected << '\n';
++                }
++            }
++        }
++        std::cout << (dtype == DataType::BF16 ? "BF16" : "F32")
++                  << " mismatches=" << mismatches - before << '\n';
++    }
++    std::cout << "checked=" << checked << " mismatches=" << mismatches << '\n';
++    return mismatches ? 1 : 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='.adaln-cpu-', dir=pathlib.Path(__file__).parent) as folder:
++    folder = pathlib.Path(folder)
++    (folder / 'test.cpp').write_text(harness)
++    subprocess.run(['clang++', '-std=c++17', '-O2', '-ffp-contract=off', str(folder / 'test.cpp'),
++                    '-o', str(folder / 'test')], check=True)
++    sys.exit(subprocess.run([str(folder / 'test')]).returncode)
+diff --git a/test/models/minimax_h3/test_stream_handoff.py b/test/models/minimax_h3/test_stream_handoff.py
+new file mode 100644
+index 0000000..ca2046e
+--- /dev/null
++++ b/test/models/minimax_h3/test_stream_handoff.py
+@@ -0,0 +1,187 @@
++"""CPU-only regression for the actual bridge methods using two deferred queues.
++
++Run directly with Python; --baseline loads the immutable src2 archive and is
++expected to fail. This verifies ordering/lifetimes, not GPU numerical accuracy.
++"""
++import ast
++import dataclasses
++import pathlib
++import sys
++import tarfile
++import types
++import unittest
++
++PROJECT = pathlib.Path(__file__).resolve().parents[5]
++SOURCE = PROJECT / '02_源码/InfiniLM/python/infinilm/multimodal/minimax_h3.py'
++BASELINE = '--baseline' in sys.argv
++if BASELINE:
++    sys.argv.remove('--baseline')
++    with tarfile.open(PROJECT / '03_上传包/src2.tar.gz') as archive:
++        SOURCE_TEXT = archive.extractfile(
++            'src/InfiniLM/python/infinilm/multimodal/minimax_h3.py'
++        ).read().decode()
++else:
++    SOURCE_TEXT = SOURCE.read_text()
++
++
++@dataclasses.dataclass(frozen=True)
++class Device:
++    type: str = 'cuda'
++    index: int = 0
++
++
++class Queues:
++    def __init__(self):
++        self.torch = {0: [], 1: []}
++        self.native = {0: [], 1: []}
++
++    def synchronize(self, device):
++        index = device if isinstance(device, int) else device.index
++        for queue in (self.torch[index], self.native[index]):
++            while queue:
++                queue.pop(0)()
++
++
++class Tensor:
++    def __init__(self, queues, value=5, shape=(1,), device=Device(), contiguous=True):
++        self.queues, self.value, self.shape = queues, value, shape
++        self.device, self.is_cuda = device, device.type == 'cuda'
++        self.ndim, self.dtype = len(shape), 'int64'
++        self._contiguous = contiguous
++
++    def is_floating_point(self):
++        return False
++
++    def contiguous(self):
++        if self._contiguous:
++            return self
++        result = Tensor(self.queues, None, self.shape, self.device)
++        self.queues.torch[self.device.index].append(
++            lambda: setattr(result, 'value', self.value)
++        )
++        return result
++
++
++class Native:
++    def __init__(self, owner):
++        self.owner, self.shape, self.dtype = owner, owner.shape, owner.dtype
++
++    def copy_(self, source):
++        self.owner.queues.native[self.owner.device.index].append(
++            lambda: setattr(self.owner, 'value', source.owner.value)
++        )
++
++
++def load_bridge(queues):
++    def deferred(value, shape=(1,), device=Device()):
++        result = Tensor(queues, None, shape, device)
++        queues.torch[device.index].append(lambda: setattr(result, 'value', value))
++        return result
++
++    def empty(shape, dtype, device):
++        # Model a recycled allocation with a previous PyTorch-stream use. An
++        # external-stream write must wait for it, even though empty writes nothing.
++        result = Tensor(queues, None, shape, device)
++        queues.torch[device.index].append(lambda: setattr(result, 'value', -999))
++        return result
++
++    torch = types.SimpleNamespace(
++        nn=types.SimpleNamespace(Module=object), int32='int32', int64='int64', bfloat16='bf16',
++        cuda=types.SimpleNamespace(synchronize=queues.synchronize), empty=empty,
++        arange=lambda n, dtype, device: deferred(7, (n,), device),
++    )
++    native = types.SimpleNamespace(
++        from_torch=Native, utils=types.SimpleNamespace(to_torch_dtype=lambda dtype: dtype),
++        # Old sync_device only waits for native work; it cannot order a preceding
++        # use of the destination on PyTorch's separate stream.
++        sync_device=lambda: [queues.native[0].pop(0)() for _ in range(len(queues.native[0]))],
++    )
++    module = types.ModuleType('_h3_stream_test')
++    sys.modules[module.__name__] = module
++    module.__dict__.update(
++        torch=torch, infinicore=native, dataclass=dataclasses.dataclass,
++        fields=dataclasses.fields, Qwen3VLForConditionalGeneration=object,
++    )
++    tree = ast.parse(SOURCE_TEXT)
++    selected = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in {
++        'MiniMaxH3TransformerInputs', 'MiniMaxH3TransformerOutput',
++        'MiniMaxH3ConditionEncoder', 'MiniMaxH3TransformerRunner',
++    }]
++    tree = ast.Module(body=[ast.ImportFrom(module='__future__', names=[
++        ast.alias(name='annotations')], level=0), *selected], type_ignores=[])
++    exec(compile(ast.fix_missing_locations(tree), str(SOURCE), 'exec'), module.__dict__)
++    module.minimax_h3_rotary_cache = lambda positions, **kw: deferred(7, (3, 96), positions.device)
++    return module, deferred
++
++
++class HandoffTests(unittest.TestCase):
++    def setUp(self):
++        self.queues = Queues()
++        self.module, self.deferred = load_bridge(self.queues)
++
++    def engine(self, inspect):
++        return types.SimpleNamespace(
++            distributed_config=types.SimpleNamespace(tp_device_ids=[0, 1]),
++            dtype='bf16', hf_config={}, forward_raw=inspect,
++        )
++
++    def test_condition_encoder_waits_for_producer(self):
++        native_input = Native(self.deferred(5))
++        encoder = object.__new__(self.module.MiniMaxH3ConditionEncoder)
++        encoder.torch_device = Device()
++        encoder._prepare_native_inputs = lambda _: {'input_ids': native_input}
++
++        def forward(input_ids, **kwargs):
++            self.assertEqual(input_ids.owner.value, 5, 'native read raced PyTorch producer')
++            return {'logits': Native(Tensor(self.queues, 11))}
++
++        encoder.engine = self.engine(forward)
++        self.assertEqual(encoder.encode({}).value, 11)
++
++    def test_transformer_waits_for_rope_and_contiguous_copy(self):
++        runner = object.__new__(self.module.MiniMaxH3TransformerRunner)
++        runner.rope_freq_dim, runner.rope_theta = 16, 10000
++        inputs = self.module.MiniMaxH3TransformerInputs(**{
++            field.name: Tensor(self.queues, shape=(3, 3) if field.name == 'position_ids'
++                else (3,) if field.name in ('token_tags', 'timestep_indices')
++                else (1, 1, 2) if field.name.endswith('hidden_states') else (1,),
++                contiguous=field.name != 'video_hidden_states')
++            for field in dataclasses.fields(self.module.MiniMaxH3TransformerInputs)
++        })
++
++        def forward(_, **kwargs):
++            self.assertEqual(kwargs['video_hidden_states'].owner.value, 5,
++                             'contiguous copy was not ready')
++            self.assertEqual(kwargs['rotary_cos_sin_cache'].owner.value, 7,
++                             'rotary cache was not ready')
++            self.assertEqual(kwargs['position_ids'].owner.value, 7)
++            return {'logits': Native(Tensor(self.queues, 11)),
++                    'hidden_states': Native(Tensor(self.queues, 13))}
++
++        runner.engine = self.engine(forward)
++        result = runner(inputs, return_torch=False)
++        self.assertEqual(result.sample.owner.value, 11)
++
++    def test_output_waits_for_recycled_destination(self):
++        result = self.module.MiniMaxH3TransformerRunner._to_torch(
++            Native(Tensor(self.queues, 17)), Device())
++        self.queues.synchronize(Device())
++        self.assertEqual(result.value, 17, 'previous PyTorch use overwrote native output')
++
++    def test_peer_reads_complete_before_return(self):
++        encoder = object.__new__(self.module.MiniMaxH3ConditionEncoder)
++        encoder.torch_device = Device()
++        encoder._prepare_native_inputs = lambda _: {'input_ids': Native(Tensor(self.queues))}
++        peer_done = []
++
++        def forward(*args, **kwargs):
++            self.queues.native[1].append(lambda: peer_done.append(True))
++            return {'logits': Native(Tensor(self.queues, 11))}
++
++        encoder.engine = self.engine(forward)
++        encoder.encode({})
++        self.assertEqual(peer_done, [True], 'peer still uses borrowed inputs after return')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/xmake.lua b/xmake.lua
+index dd04bbb..d9ea3ca 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,7 +1,20 @@
+-add_requires("pybind11")
++-- pybind11 is header-only; an offline host can point PYBIND11_INCLUDE at a
++-- local copy instead of fetching the package.
++local pybind11_include = os.getenv("PYBIND11_INCLUDE")
++if pybind11_include then
++    add_includedirs(pybind11_include, {public = true})
++else
++    add_requires("pybind11")
++end
+ 
+ set_toolchains("gcc")
+ 
++-- 离线镜像里 python*-config 不一定可用，显式提供解释器头文件路径。
++local python_include = os.getenv("PYTHON_INCLUDE")
++if python_include and os.isdir(python_include) then
++    add_includedirs(python_include, {public = true})
++end
++
+ option("cxx11-abi")
+     set_default(nil)
+     set_showmenu(true)
+@@ -22,7 +35,9 @@ add_includedirs("third_party/spdlog/include")
+ add_includedirs("third_party/json/single_include/")
+ 
+ target("_infinilm")
+-    add_packages("pybind11")
++    if not pybind11_include then
++        add_packages("pybind11")
++    end
+     set_default(false)
+     add_rules("python.module", {soabi = true})
+     set_languages("cxx17")

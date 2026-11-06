@@ -1,0 +1,24 @@
+diff --git a/src/ntops/kernels/median.py b/src/ntops/kernels/median.py
+index d25249a..50d63c3 100644
+--- a/src/ntops/kernels/median.py
++++ b/src/ntops/kernels/median.py
+@@ -1,7 +1,18 @@
+ import functools
+ 
+ import ninetoothed.language as ntl
+-import triton.language as tl  # [FIX 1] 导入标准 triton language
++
++try:
++    import triton.language as tl
++except ModuleNotFoundError:  # Triton 只在这个 kernel 内部用到，不应阻塞整个包导入
++    class _TritonLanguageStub:
++        def __getattr__(self, name):
++            raise ImportError(
++                f"ntops.kernels.median 需要 triton.language.{name}；"
++                "构建该算子前请先安装 triton。"
++            )
++
++    tl = _TritonLanguageStub()
+ from ninetoothed import Tensor
+ 
+ from ntops.kernels.reduction import arrangement

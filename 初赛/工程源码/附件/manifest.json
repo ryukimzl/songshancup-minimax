@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "path": "附件/offline/build_tool_xmake.tar.gz",
+      "bytes": 1954412,
+      "sha256": "99df17ad8eaaba5d1e918c6915ba210b08b7931203fb6241e096e9010526f8f1"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part00",
+      "bytes": 104857600,
+      "sha256": "bfaa757e842676886c87e896e5829302a7ed9410dd3e10de12280614e89ec488"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part01",
+      "bytes": 104857600,
+      "sha256": "33113a801a3a34511f6db536a848221f68eddcb5a4db30a05d8d122df11970e6"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part02",
+      "bytes": 104857600,
+      "sha256": "1e287480287f0a187257e7fcfd50572e62dac5a9323cddce06e7cf8d5d0149a2"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part03",
+      "bytes": 104857600,
+      "sha256": "5c25cd0275d8da39cbc72d7b0dde24a32ea305c51b3073edb7a9599e4c76781c"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part04",
+      "bytes": 104857600,
+      "sha256": "dcd9aed482d4b9d5e8d911de05c6449a825110f7de3aa49b9f06acd735534a24"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part05",
+      "bytes": 104857600,
+      "sha256": "98e8e63ea06dfd32424b935a1afc1119711d0f0f11e4c0ab7c8fe9295a3a3c50"
+    },
+    {
+      "path": "附件/offline/flash_attention/flash_attention.whl.part06",
+      "bytes": 29752943,
+      "sha256": "7c4e4b3d0eb30d6a90864e780755b5496a2a35ce22ec72d877642f0b020fd3d1"
+    },
+    {
+      "path": "附件/offline/flash_attention/triton_dtk2604.whl",
+      "bytes": 105484167,
+      "sha256": "e397b16365da22508353ce44a45f5be82f8ee58e49853a3df06aa8f6f83d5581"
+    },
+    {
+      "path": "附件/offline/python_deps_base.tar.gz",
+      "bytes": 113454054,
+      "sha256": "704341786e71c23ea6cb5812cc5b4af5f244e0a3bc110fcef1bdc7984250ba0b"
+    },
+    {
+      "path": "附件/offline/python_deps_metrics.tar.gz",
+      "bytes": 51687506,
+      "sha256": "a694cdca68d1b9d1974ce7402df60edf599b09f44f78ee0d70c777e8e98dad88"
+    },
+    {
+      "path": "附件/offline/python_deps_models.tar.gz",
+      "bytes": 26301148,
+      "sha256": "488611f264b1d126f1c0ac6ef3ccfa3de978f56e23e2fb89b220ae235d8404dd"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1488,
+      "sha256": "97510de9672f36334f025ee5cec3c5ca05dc175b3d6994ff3442d086b542f6da"
+    },
+    {
+      "path": "run.sh",
+      "bytes": 132,
+      "sha256": "6e270a8e9637ffdfe7f64b7badd692a7338ed6e19c64d9bba3653acf1946469e"
+    },
+    {
+      "path": "技术报告.md",
+      "bytes": 5677,
+      "sha256": "3fa5383160f022804d629e63188f67914dabfbfc4071e192a731e0ba9bba7aca"
+    },
+    {
+      "path": "附件/patches/InfiniCore.patch",
+      "bytes": 17057,
+      "sha256": "b5a1a8c508dc0d8d45f86d09b2adfd7bdc9cb197695883839541147a928713c5"
+    },
+    {
+      "path": "附件/patches/InfiniLM.patch",
+      "bytes": 121341,
+      "sha256": "d8fa477c10bc037f8888b5672b69c8b1a79cc4419d346ebfb3a5c42b94b8cb46"
+    },
+    {
+      "path": "附件/patches/ninetoothed.patch",
+      "bytes": 7298,
+      "sha256": "d4a0807b218ca08641b277a0b87f9ef4eda070686b1b3b214f6639bdd17aa208"
+    },
+    {
+      "path": "附件/patches/ntops.patch",
+      "bytes": 824,
+      "sha256": "3c4dec707c566e05cd5f771dc894b2df88a12f7e818f10be74c9c316ee0f1d5a"
+    },
+    {
+      "path": "附件/patches/patch-manifest.json",
+      "bytes": 1814,
+      "sha256": "26f9a8166ac89082751419bfb72aa4b3602cec34e2246efb4b5da67820b29168"
+    },
+    {
+      "path": "附件/scripts/entry.py",
+      "bytes": 9756,
+      "sha256": "b2637778c157d08674e151b39c4a5e02dc996804fc6869bdd0deb7b8e892803f"
+    },
+    {
+      "path": "附件/scripts/evaluate_existing.py",
+      "bytes": 3586,
+      "sha256": "2c5ee10266e708d47e0109b4c24bafe9bf9ce4b42f07e804935eeb26c062b07d"
+    },
+    {
+      "path": "附件/scripts/prepare_submission.py",
+      "bytes": 2501,
+      "sha256": "89b5c1c1d3aacc7187960628df82ae5dcadb50c246e4a7f118e2cf893bf9d3ab"
+    },
+    {
+      "path": "附件/scripts/run_fl2va.sh",
+      "bytes": 36606,
+      "sha256": "aeac125c3327c88cf7e19f189648d37e9557c23f27f75e4c1ae623810b48714f"
+    },
+    {
+      "path": "附件/source/fl2va_source_20261105_r10.tar.gz",
+      "bytes": 6236965,
+      "sha256": "b6cbebac036ccdcaeaf77a05ee4d4258d5aa0bc279e1aaf1d427f27f2e743125"
+    },
+    {
+      "path": "附件/submission.json",
+      "bytes": 3616,
+      "sha256": "7f8cda029b160558cd8f05c19061459bb87181a9b90acb966bfb0bb42396af99"
+    },
+    {
+      "path": "附件/tools/minimax_h3_compare.py",
+      "bytes": 28708,
+      "sha256": "e143c28e4b3acb885662e0aa238aa00ca17cbcc82077f465f2ce57d0f1225590"
+    },
+    {
+      "path": "附件/参考/参考.mp4",
+      "bytes": 1537907,
+      "sha256": "3819f5d47770887429657fc71b6d938332da41c5176589c914c0d7b5514ef7fb"
+    }
+  ]
+}

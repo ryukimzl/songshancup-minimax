@@ -1,0 +1,13 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.pyc
+
+# 运行时由 恢复.sh 从 传输分片/ 展开，不重复入库
+工程源码/附件/offline/
+工程源码/结果/
+
+# 离线依赖二进制受 GitHub 单文件大小限制，经 Releases 分发；仓库保留清单与校验值
+离线依赖/*.tar.gz
+离线依赖/*.whl
+离线依赖/FlashAttention.part*

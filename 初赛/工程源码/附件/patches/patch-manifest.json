@@ -1,0 +1,45 @@
+[
+  {
+    "repository": "InfiniCore",
+    "base_commit": "f32e2fbb2a9b2ca912b5711f4f3836c403196a74",
+    "patch": "InfiniCore.patch",
+    "patch_sha256": "b5a1a8c508dc0d8d45f86d09b2adfd7bdc9cb197695883839541147a928713c5",
+    "excluded_submodule_paths": [
+      "submodules/InfiniCCL",
+      "submodules/InfiniOps",
+      "submodules/InfiniRT",
+      "third_party/cutlass",
+      "third_party/flash-attention",
+      "third_party/mate",
+      "third_party/spdlog"
+    ],
+    "scope": "Top-level repository patch; vendored/submodule file contents are supplied by the complete frozen source archive"
+  },
+  {
+    "repository": "InfiniLM",
+    "base_commit": "65deb91f840ebaef752d028fad2f3217ce0950f4",
+    "patch": "InfiniLM.patch",
+    "patch_sha256": "d8fa477c10bc037f8888b5672b69c8b1a79cc4419d346ebfb3a5c42b94b8cb46",
+    "excluded_submodule_paths": [
+      "third_party/json",
+      "third_party/spdlog"
+    ],
+    "scope": "Top-level repository patch; vendored/submodule file contents are supplied by the complete frozen source archive"
+  },
+  {
+    "repository": "ninetoothed",
+    "base_commit": "f64a6de566aa1c7321aed92edb9285690cbf3c66",
+    "patch": "ninetoothed.patch",
+    "patch_sha256": "d4a0807b218ca08641b277a0b87f9ef4eda070686b1b3b214f6639bdd17aa208",
+    "excluded_submodule_paths": [],
+    "scope": "Top-level repository patch; vendored/submodule file contents are supplied by the complete frozen source archive"
+  },
+  {
+    "repository": "ntops",
+    "base_commit": "82cba6cf2200919b5d12c86adbea60cbfb516040",
+    "patch": "ntops.patch",
+    "patch_sha256": "3c4dec707c566e05cd5f771dc894b2df88a12f7e818f10be74c9c316ee0f1d5a",
+    "excluded_submodule_paths": [],
+    "scope": "Top-level repository patch; vendored/submodule file contents are supplied by the complete frozen source archive"
+  }
+]

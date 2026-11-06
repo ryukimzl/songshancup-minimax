@@ -1,0 +1,199 @@
+diff --git a/src/ninetoothed/backends/emitters/cuda.py b/src/ninetoothed/backends/emitters/cuda.py
+index 0346940..28793f7 100644
+--- a/src/ninetoothed/backends/emitters/cuda.py
++++ b/src/ninetoothed/backends/emitters/cuda.py
+@@ -156,6 +156,9 @@ class CudaTarget(CComputedTypesMixin, EmitterTarget):
+         if name == "rand" and len(args) >= 2:
+             return f"{self.global_helper('ninetoothed_curand_uniform')}(({args[0]}), ({args[1]}))"
+ 
++        if name == "sigmoid" and len(args) == 1:
++            return f"{self.global_helper('_nt_sigmoid')}({args[0]})"
++
+         functions = {
+             "abs": "fabsf",
+             "acos": "acosf",
+@@ -1032,6 +1035,16 @@ __all__ = ["CudaTarget", "TARGET", "emit"]
+ 
+ 
+ _ARITHMETIC_SUPPORT = """
++__device__ inline float _nt_sigmoid(float value) {
++    return 1.0f / (1.0f + expf(-value));
++}
++__device__ inline double _nt_sigmoid(double value) {
++    return 1.0 / (1.0 + exp(-value));
++}
++template <class T> __device__ T _nt_sigmoid(T value) {
++    return static_cast<T>(_nt_sigmoid(static_cast<float>(value)));
++}
++
+ template <class T> __device__ T _nt_reduce_max(T lhs, T rhs) {
+     return lhs > rhs ? lhs : rhs;
+ }
+diff --git a/src/ninetoothed/backends/toolchain.py b/src/ninetoothed/backends/toolchain.py
+index 91fc083..201f2ff 100644
+--- a/src/ninetoothed/backends/toolchain.py
++++ b/src/ninetoothed/backends/toolchain.py
+@@ -10,6 +10,10 @@ from typing import Any
+ 
+ _CUDA_ARCH_PATTERN = re.compile(r"(?:sm|compute)_[0-9]{2,}[a-z]?")
+ 
++# Hygon DCUs are programmed through DTK's CUDA-compatible compiler, which takes
++# the gfx target name directly (for example `gfx936` for the BW series).
++_HYGON_ARCH_PATTERN = re.compile(r"gfx[0-9]{3,4}[a-z]?")
++
+ 
+ def normalize_cuda_arch(value: Any) -> str:
+     """Return a validated NVCC architecture value."""
+@@ -18,10 +22,14 @@ def normalize_cuda_arch(value: Any) -> str:
+ 
+     arch = value.strip().lower()
+ 
+-    if arch != "native" and _CUDA_ARCH_PATTERN.fullmatch(arch) is None:
++    if (
++        arch != "native"
++        and _CUDA_ARCH_PATTERN.fullmatch(arch) is None
++        and _HYGON_ARCH_PATTERN.fullmatch(arch) is None
++    ):
+         raise ValueError(
+             "The CUDA `arch` backend option must be `native`, `sm_<version>`, "
+-            "or `compute_<version>`."
++            "`compute_<version>`, or a Hygon `gfx<version>` target."
+         )
+ 
+     return arch
+@@ -31,7 +39,7 @@ def cuda_compute_capability(arch: str) -> str | None:
+     """Infer a pass constraint value from a concrete NVCC architecture."""
+     arch = normalize_cuda_arch(arch)
+ 
+-    if arch == "native":
++    if arch == "native" or _HYGON_ARCH_PATTERN.fullmatch(arch) is not None:
+         return None
+ 
+     digits = re.search(r"[0-9]+", arch)
+diff --git a/src/ninetoothed/frontend/python.py b/src/ninetoothed/frontend/python.py
+index 80c3f03..cf1de13 100644
+--- a/src/ninetoothed/frontend/python.py
++++ b/src/ninetoothed/frontend/python.py
+@@ -1582,6 +1582,16 @@ class _ApplicationSSABuilder:
+         if name not in {"sum", "max", "min"}:
+             return None
+ 
++        if name in {"max", "min"} and _is_binary_extremum(node, operands):
++            operator = "maximum" if name == "max" else "minimum"
++
++            return self._emit(
++                operations,
++                f"arith.{operator}",
++                operands=(operands[0].name, operands[1].name),
++                result_type=_math_result_type(operator, operands),
++            )
++
+         if not operands:
+             raise _lowering_error(node, f"`{name}()` requires an input operand")
+ 
+@@ -2114,6 +2124,33 @@ _SUPPORTED_MATH_CALLS = {
+ }
+ 
+ 
++def _is_binary_extremum(node: ast.Call, operands) -> bool:
++    """Tell the pairwise builtin ``max``/``min`` apart from the reduction form.
++
++    ``max(0.0, x)`` clamps elementwise, while ``max(x, 0)`` reduces along a
++    literal axis.  The reduction form always passes a literal integer axis, or
++    names one with the ``axis``/``dim`` keyword; every other two-operand call
++    that touches a tensor is elementwise.
++    """
++    if len(operands) != 2:
++        return False
++
++    if any(keyword.arg in {"axis", "dim"} for keyword in node.keywords):
++        return False
++
++    if len(node.args) > 1:
++        second = node.args[1]
++
++        if (
++            isinstance(second, ast.Constant)
++            and isinstance(second.value, int)
++            and not isinstance(second.value, bool)
++        ):
++            return False
++
++    return any(getattr(operand.type, "kind", None) == "tensor" for operand in operands)
++
++
+ def _axis_from_call(node: ast.Call, *, positional_index: int) -> Any:
+     if len(node.args) > positional_index:
+         return _literal_value(node.args[positional_index])
+diff --git a/src/ninetoothed/language.py b/src/ninetoothed/language.py
+index a858169..1310076 100644
+--- a/src/ninetoothed/language.py
++++ b/src/ninetoothed/language.py
+@@ -1,6 +1,20 @@
+ import ast
+ 
+-from triton.language.extra import libdevice
++try:
++    from triton.language.extra import libdevice
++except ModuleNotFoundError:  # Triton is optional for source-emitting backends.
++
++    class _UnavailableLibdevice:
++        """Placeholder that explains why libdevice calls are unsupported."""
++
++        def __getattr__(self, name):
++            raise ImportError(
++                f"ninetoothed.language.libdevice.{name} needs Triton. Install "
++                "`triton`, or use backend='cuda' which compiles with the vendor "
++                "toolchain and does not provide libdevice bindings."
++            )
++
++    libdevice = _UnavailableLibdevice()
+ 
+ from ninetoothed.symbol import Symbol
+ 
+diff --git a/src/ninetoothed/utils.py b/src/ninetoothed/utils.py
+index cf7c407..52aea6f 100644
+--- a/src/ninetoothed/utils.py
++++ b/src/ninetoothed/utils.py
+@@ -1,12 +1,30 @@
+ from contextlib import contextmanager
+ 
+-import triton
++
++def _triton_driver():
++    """Return Triton's active driver.
++
++    Triton is optional for source-emitting backends: the CUDA backend compiles
++    with the vendor toolchain and never queries Triton's driver, so importing
++    this module must not require Triton to be installed.  (On some vendors a
++    Triton build cannot even read the device properties, which would also fail
++    at import time.)
++    """
++    try:
++        import triton
++    except ModuleNotFoundError as error:
++        raise RuntimeError(
++            "This NineToothed path needs Triton's runtime driver. Install "
++            "`triton`, or use a source backend such as backend='cuda'."
++        ) from error
++
++    return triton.runtime.driver.active
+ 
+ 
+ @contextmanager
+ def device_scope(device):
+     """Select a device through the active Triton driver and restore it afterward."""
+-    driver = triton.runtime.driver.active
++    driver = _triton_driver()
+     previous = driver.get_current_device()
+     index = device if isinstance(device, int) else getattr(device, "index", None)
+     changed = index is not None and index != previous
+@@ -23,7 +41,7 @@ def device_scope(device):
+ 
+ def get_device_properties(device=None):
+     """Normalize device limits through the active driver's runtime interface."""
+-    driver = triton.runtime.driver.active
++    driver = _triton_driver()
+ 
+     with device_scope(device):
+         properties = dict(

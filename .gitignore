@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 运行时产物
+初赛/工程源码/结果/
+初赛/工程源码/附件/offline/
+
+# 离线依赖二进制（单文件超过 GitHub 100MB 限制，经 Releases 分发）
+初赛/离线依赖/*.tar.gz
+初赛/离线依赖/*.whl
+初赛/离线依赖/FlashAttention.part*
