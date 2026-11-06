@@ -9,8 +9,12 @@
 
 1、将整个初赛文件夹上传到个人AFS的根目录。例：个人目录/初赛。
 （复现完成后个人目录下会有初赛、fl2va-r10-submission两个文件夹。）
-2、申请独占8卡的资源，执行如下命令。
+2、下载 Release 上的 12 个离线包，放入 `个人目录/初赛/离线依赖`（资源名与文件名一致，无需改名）。
+3、申请独占 8 卡的资源，打开终端执行如下命令。
 ```bash
+# 进入工作目录：把下面的路径换成你自己的 AFS 根目录
+export IFAB_AFS_HOME=/path/to/your/afs
+cd "$IFAB_AFS_HOME/初赛"
 # 构建 InfiniCore 及配套绑定
 bash run.sh build-core
 # 构建 InfiniLM 及配套 SDK 绑定
