@@ -36,18 +36,22 @@ bash run.sh check
 ### 仓库内容说明
 
 - `初赛/工程源码/`：复现所需的源码、补丁、脚本与参考视频（体积较小，正常提交）。
-- `初赛/离线依赖/`：仓库内只保留 `恢复.sh`、`下载依赖.sh`、`传输清单.json`、`文件清单.md`、`release-assets.json`。12 个二进制依赖（合计 913 MB）因超出 GitHub 单文件 100 MB 硬限制未进入 Git 历史，全部随 Release 分发。
+- `初赛/离线依赖/`：仓库内只保留 `恢复.sh`、`传输清单.json`、`文件清单.md`、`release-assets.json`。12 个二进制依赖（合计 913 MB）因超出 GitHub 单文件 100 MB 硬限制未进入 Git 历史，全部随 Release 分发。
+- 二进制文件名与 `工程源码/附件/submission.json` 的 `store_path` 一致，从 Release 下载后**无需改名**即可直接使用。
 - 提交前请核对 `初赛/离线依赖/传输清单.json` 与 `文件清单.md` 中的校验值。
 
 ### 获取离线依赖（首次使用必做）
 
-12 个依赖二进制挂在 Release [v0-r10-deps](https://github.com/ryukimzl/songshancup-minimax/releases/tag/v0-r10-deps) 上，执行下面一条命令即可下载、改回原始文件名并逐个校验 SHA256：
+12 个依赖二进制挂在 Release [v0-r10-deps](https://github.com/ryukimzl/songshancup-minimax/releases/tag/v0-r10-deps) 上，Release 资源名与本地文件名完全一致：
 
 ```bash
 cd 初赛/离线依赖
-bash 下载依赖.sh                 # 直连
-# 需要代理时：
-https_proxy=http://127.0.0.1:7890 bash 下载依赖.sh
+for n in build_tool_xmake.tar.gz python_deps_base.tar.gz python_deps_models.tar.gz \
+         python_deps_metrics.tar.gz triton_dtk2604.whl \
+         flash_attention.whl.part0{0,1,2,3,4,5,6}; do
+  curl -fL --retry 3 -C - -o "$n" \
+    "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/$n"
+done
 ```
 
-校验通过后目录中会出现 `构建工具_Xmake.tar.gz`、`Python基础依赖.tar.gz`、`Python模型依赖.tar.gz`、`视频评测依赖.tar.gz`、`Triton依赖.whl`、`FlashAttention.part01` 至 `part07`，与原提交包一致。GitHub 对 Release 资源名有 ASCII 限制，因此资源名（如 `flash_attention.whl.part00`）与原始中文文件名不同，映射关系见 `初赛/离线依赖/release-assets.json`。
+也可以从发布页手动下载这 12 个文件，直接放进 `初赛/离线依赖/`。之后 `bash run.sh build-core` 会自动调用 `恢复.sh`，按 `传输清单.json` 逐个校验 SHA256 并展开到 `工程源码/附件/offline/`。

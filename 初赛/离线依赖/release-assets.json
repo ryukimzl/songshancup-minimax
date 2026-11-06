@@ -8,99 +8,87 @@
     "assets_count": 12,
     "assets_total_bytes": 957779830
   },
-  "note": "GitHub Release 资源名必须为 ASCII，故资源名与原始中文文件名不同；用 bash 下载依赖.sh 可自动下载并按原名落盘、校验 SHA256。",
+  "note": "Release 资源名与 初赛/离线依赖/ 下的文件名完全一致，下载后无需改名；SHA256 与 传输清单.json 一致。",
   "assets": [
     {
-      "asset": "build_tool_xmake.tar.gz",
-      "original": "构建工具_Xmake.tar.gz",
+      "name": "build_tool_xmake.tar.gz",
       "bytes": 1954412,
       "sha256": "99df17ad8eaaba5d1e918c6915ba210b08b7931203fb6241e096e9010526f8f1",
       "asset_id": 717772415,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/build_tool_xmake.tar.gz"
     },
     {
-      "asset": "python_deps_base.tar.gz",
-      "original": "Python基础依赖.tar.gz",
+      "name": "python_deps_base.tar.gz",
       "bytes": 113454054,
       "sha256": "704341786e71c23ea6cb5812cc5b4af5f244e0a3bc110fcef1bdc7984250ba0b",
       "asset_id": 717772531,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/python_deps_base.tar.gz"
     },
     {
-      "asset": "python_deps_models.tar.gz",
-      "original": "Python模型依赖.tar.gz",
+      "name": "python_deps_models.tar.gz",
       "bytes": 26301148,
       "sha256": "488611f264b1d126f1c0ac6ef3ccfa3de978f56e23e2fb89b220ae235d8404dd",
       "asset_id": 717771548,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/python_deps_models.tar.gz"
     },
     {
-      "asset": "python_deps_metrics.tar.gz",
-      "original": "视频评测依赖.tar.gz",
+      "name": "python_deps_metrics.tar.gz",
       "bytes": 51687506,
       "sha256": "a694cdca68d1b9d1974ce7402df60edf599b09f44f78ee0d70c777e8e98dad88",
       "asset_id": 717776789,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/python_deps_metrics.tar.gz"
     },
     {
-      "asset": "triton_dtk2604.whl",
-      "original": "Triton依赖.whl",
+      "name": "triton_dtk2604.whl",
       "bytes": 105484167,
       "sha256": "e397b16365da22508353ce44a45f5be82f8ee58e49853a3df06aa8f6f83d5581",
       "asset_id": 717777425,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/triton_dtk2604.whl"
     },
     {
-      "asset": "flash_attention.whl.part00",
-      "original": "FlashAttention.part01",
+      "name": "flash_attention.whl.part00",
       "bytes": 104857600,
       "sha256": "bfaa757e842676886c87e896e5829302a7ed9410dd3e10de12280614e89ec488",
       "asset_id": 717779351,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part00"
     },
     {
-      "asset": "flash_attention.whl.part01",
-      "original": "FlashAttention.part02",
+      "name": "flash_attention.whl.part01",
       "bytes": 104857600,
       "sha256": "33113a801a3a34511f6db536a848221f68eddcb5a4db30a05d8d122df11970e6",
       "asset_id": 717781144,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part01"
     },
     {
-      "asset": "flash_attention.whl.part02",
-      "original": "FlashAttention.part03",
+      "name": "flash_attention.whl.part02",
       "bytes": 104857600,
       "sha256": "1e287480287f0a187257e7fcfd50572e62dac5a9323cddce06e7cf8d5d0149a2",
       "asset_id": 717782873,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part02"
     },
     {
-      "asset": "flash_attention.whl.part03",
-      "original": "FlashAttention.part04",
+      "name": "flash_attention.whl.part03",
       "bytes": 104857600,
       "sha256": "5c25cd0275d8da39cbc72d7b0dde24a32ea305c51b3073edb7a9599e4c76781c",
       "asset_id": 717784037,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part03"
     },
     {
-      "asset": "flash_attention.whl.part04",
-      "original": "FlashAttention.part05",
+      "name": "flash_attention.whl.part04",
       "bytes": 104857600,
       "sha256": "dcd9aed482d4b9d5e8d911de05c6449a825110f7de3aa49b9f06acd735534a24",
       "asset_id": 717785773,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part04"
     },
     {
-      "asset": "flash_attention.whl.part05",
-      "original": "FlashAttention.part06",
+      "name": "flash_attention.whl.part05",
       "bytes": 104857600,
       "sha256": "98e8e63ea06dfd32424b935a1afc1119711d0f0f11e4c0ab7c8fe9295a3a3c50",
       "asset_id": 717787346,
       "download_url": "https://github.com/ryukimzl/songshancup-minimax/releases/download/v0-r10-deps/flash_attention.whl.part05"
     },
     {
-      "asset": "flash_attention.whl.part06",
-      "original": "FlashAttention.part07",
+      "name": "flash_attention.whl.part06",
       "bytes": 29752943,
       "sha256": "7c4e4b3d0eb30d6a90864e780755b5496a2a35ce22ec72d877642f0b020fd3d1",
       "asset_id": 717789168,

@@ -15,7 +15,4 @@ venv/
 # 离线依赖二进制（单文件超过 GitHub 100MB 限制，经 Releases 分发）
 初赛/离线依赖/*.tar.gz
 初赛/离线依赖/*.whl
-初赛/离线依赖/FlashAttention.part*
-
-# 下载依赖.sh 的断点临时文件
-初赛/离线依赖/*.part
+初赛/离线依赖/*.part*

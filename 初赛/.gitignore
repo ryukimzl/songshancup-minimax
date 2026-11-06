@@ -10,6 +10,4 @@ __pycache__/
 # 离线依赖二进制受 GitHub 单文件大小限制，经 Releases 分发；仓库保留清单与校验值
 离线依赖/*.tar.gz
 离线依赖/*.whl
-离线依赖/FlashAttention.part*
-# 下载依赖.sh 的断点临时文件
-离线依赖/*.part
+离线依赖/*.part*

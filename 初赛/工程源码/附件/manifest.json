@@ -62,19 +62,9 @@
       "sha256": "488611f264b1d126f1c0ac6ef3ccfa3de978f56e23e2fb89b220ae235d8404dd"
     },
     {
-      "path": "README.md",
-      "bytes": 1488,
-      "sha256": "97510de9672f36334f025ee5cec3c5ca05dc175b3d6994ff3442d086b542f6da"
-    },
-    {
       "path": "run.sh",
       "bytes": 132,
       "sha256": "6e270a8e9637ffdfe7f64b7badd692a7338ed6e19c64d9bba3653acf1946469e"
-    },
-    {
-      "path": "技术报告.md",
-      "bytes": 5677,
-      "sha256": "3fa5383160f022804d629e63188f67914dabfbfc4071e192a731e0ba9bba7aca"
     },
     {
       "path": "附件/patches/InfiniCore.patch",
