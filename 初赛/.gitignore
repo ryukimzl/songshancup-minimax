@@ -11,3 +11,5 @@ __pycache__/
 离线依赖/*.tar.gz
 离线依赖/*.whl
 离线依赖/FlashAttention.part*
+# 下载依赖.sh 的断点临时文件
+离线依赖/*.part
